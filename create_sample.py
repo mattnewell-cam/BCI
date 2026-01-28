@@ -251,7 +251,8 @@ def save_recording(data, timestamps, name, fs, ch_labels, recordings_dir="record
     # Create filename with timestamp
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
-    filename = f"{safe_name}_{timestamp_str}.npz"
+    # filename = f"{safe_name}_{timestamp_str}.npz"
+    filename = f"{safe_name}.npz"
     filepath = os.path.join(recordings_dir, filename)
 
     # Save with metadata

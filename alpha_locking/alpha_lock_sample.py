@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 from alpha_lock_logic import AlphaLockProcessor, beep
 
 
-def list_recordings(recordings_dir="recordings"):
+def list_recordings(recordings_dir="../recordings"):
     """List available recordings."""
     path = Path(recordings_dir)
     if not path.exists():
