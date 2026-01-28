@@ -17,7 +17,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
-from scipy.signal import spectrogram as scipy_spectrogram
+from scipy.signal import spectrogram as scipy_spectrogram, welch
 import matplotlib.pyplot as plt
 
 from alpha_lock_sample import load_recording, list_recordings
@@ -62,6 +62,53 @@ def compute_spectrogram(data_1ch, fs, f_min=0, f_max=30):
     power_dB = 10 * np.log10(Sxx + 1e-20)
 
     return times, freqs, power_dB
+
+
+def compute_mean_psd(data_1ch, fs, f_min=0, f_max=30, bw=0.5, step=0.1):
+    """Compute mean PSD with rolling frequency windows.
+
+    Uses Welch's method at high resolution, then averages within sliding
+    windows of width *bw* Hz, stepped at *step* Hz.
+
+    Parameters
+    ----------
+    data_1ch : ndarray
+        Raw samples for one channel.
+    fs : float
+        Sampling rate (Hz).
+    f_min, f_max : float
+        Frequency range.
+    bw : float
+        Rolling window width (Hz).
+    step : float
+        Step between window centres (Hz).
+
+    Returns
+    -------
+    centers : ndarray
+        Frequency centres (Hz).
+    mean_db : ndarray
+        Mean power (dB) at each centre.
+    """
+    # Welch PSD at 0.1 Hz native resolution (nperseg = 10 * fs)
+    nperseg = min(int(10 * fs), len(data_1ch))
+    freqs, psd = welch(data_1ch, fs=fs, nperseg=nperseg)
+
+    psd_db = 10 * np.log10(psd + 1e-20)
+
+    half = bw / 2
+    centers = np.arange(f_min, f_max + step / 2, step)
+    mean_db = np.empty(len(centers))
+    for i, fc in enumerate(centers):
+        mask = (freqs >= fc - half) & (freqs <= fc + half)
+        if np.any(mask):
+            mean_db[i] = psd_db[mask].mean()
+        else:
+            # No bins in window — interpolate from nearest
+            idx = np.argmin(np.abs(freqs - fc))
+            mean_db[i] = psd_db[idx]
+
+    return centers, mean_db
 
 
 def plot_spectrogram(recording, f_min=0, f_max=30):
@@ -133,12 +180,14 @@ def plot_spectrogram(recording, f_min=0, f_max=30):
         axes.append(ax)
         meshes.append(mesh)
 
-        # Mean PSD side panel (frequency on Y to align with spectrogram)
+        # Mean PSD side panel (rolling 0.5 Hz windows at 0.1 Hz steps)
         ax_psd = fig.add_axes([psd_left, bottom, psd_width, panel_height],
                               sharey=ax)
-        mean_psd = pdb.mean(axis=1)  # average dB across time
-        ax_psd.plot(mean_psd, f, color="white", lw=1.2)
-        ax_psd.fill_betweenx(f, vmin, mean_psd, alpha=0.3, color="cyan")
+        psd_freqs, mean_psd = compute_mean_psd(
+            data[i], fs, f_min, f_max, bw=0.5, step=0.1,
+        )
+        ax_psd.plot(mean_psd, psd_freqs, color="white", lw=1.2)
+        ax_psd.fill_betweenx(psd_freqs, vmin, mean_psd, alpha=0.3, color="cyan")
         ax_psd.set_xlim(vmin, vmax)
         ax_psd.set_facecolor("#1a1a2e")
         ax_psd.tick_params(labelleft=False)
@@ -148,9 +197,9 @@ def plot_spectrogram(recording, f_min=0, f_max=30):
             ax_psd.set_xlabel("dB", fontsize=8)
 
         # Flag alpha peak (8-12 Hz)
-        alpha_mask = (f >= 8) & (f <= 12)
+        alpha_mask = (psd_freqs >= 8) & (psd_freqs <= 12)
         if np.any(alpha_mask):
-            alpha_freqs = f[alpha_mask]
+            alpha_freqs = psd_freqs[alpha_mask]
             alpha_psd = mean_psd[alpha_mask]
             peak_idx = np.argmax(alpha_psd)
             peak_freq = alpha_freqs[peak_idx]
