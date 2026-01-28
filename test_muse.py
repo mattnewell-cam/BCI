@@ -17,12 +17,16 @@ from collections import deque
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
 from matplotlib.animation import FuncAnimation
 from scipy.signal import welch, butter, sosfilt, sosfilt_zi
 
 from pylsl import StreamInlet
-from utils import find_eeg_stream, get_channel_labels
+from utils import (
+    find_eeg_stream,
+    get_channel_labels,
+    assess_channel_quality,
+    get_quality_color,
+)
 
 
 # Muse channel positions (approximate 10-20 layout for display)
@@ -33,167 +37,13 @@ CHANNEL_POSITIONS = {
     "TP10": (0.8, -0.3),   # Right ear
 }
 
-# Quality thresholds
-QUALITY_THRESHOLDS = {
-    "variance_min": 5.0,       # µV² - below this is flat/no signal
-    "variance_max": 10000.0,   # µV² - above this is saturated/artifact
-    "slope_good": -0.8,        # 1/f slope - real EEG typically -1 to -2
-    "slope_marginal": -0.3,    # Flatter than this suggests noise
-    "hf_ratio_max": 0.4,       # High freq (>30Hz) to total power ratio
-    "line_noise_max": 0.5,     # 50/60Hz power relative to neighbors
-}
-
-
-def compute_psd(data, fs):
-    """Compute power spectral density using Welch's method."""
-    if len(data) < fs:
-        return None, None
-    freqs, psd = welch(data, fs=fs, nperseg=min(len(data), int(fs * 2)))
-    return freqs, psd
-
-
-def compute_spectral_slope(freqs, psd, f_low=2, f_high=40):
-    """
-    Compute spectral slope in log-log space.
-    Real EEG has 1/f characteristic with negative slope (-1 to -2).
-    White noise has slope ~0.
-    """
-    mask = (freqs >= f_low) & (freqs <= f_high)
-    if np.sum(mask) < 5:
-        return 0.0
-
-    log_f = np.log10(freqs[mask])
-    log_p = np.log10(psd[mask] + 1e-12)
-
-    # Linear regression in log-log space
-    slope, _ = np.polyfit(log_f, log_p, 1)
-    return slope
-
-
-def compute_hf_ratio(freqs, psd, cutoff=30):
-    """Ratio of high-frequency power (>cutoff) to total power."""
-    total = np.trapezoid(psd, freqs)
-    if total < 1e-12:
-        return 1.0
-    hf_mask = freqs > cutoff
-    hf_power = np.trapezoid(psd[hf_mask], freqs[hf_mask]) if np.any(hf_mask) else 0
-    return hf_power / total
-
-
-def compute_line_noise_ratio(freqs, psd, line_freq=50):
-    """
-    Check for excessive line noise (50 or 60 Hz).
-    Returns ratio of line freq power to neighboring frequencies.
-    """
-    # Look at both 50 and 60 Hz
-    for lf in [50, 60]:
-        mask_line = (freqs >= lf - 2) & (freqs <= lf + 2)
-        mask_neighbor = ((freqs >= lf - 10) & (freqs < lf - 2)) | \
-                        ((freqs > lf + 2) & (freqs <= lf + 10))
-
-        if np.sum(mask_line) > 0 and np.sum(mask_neighbor) > 0:
-            line_power = np.mean(psd[mask_line])
-            neighbor_power = np.mean(psd[mask_neighbor])
-            if neighbor_power > 1e-12:
-                ratio = line_power / neighbor_power
-                if ratio > 3:  # Significant line noise
-                    return ratio / 10  # Normalize
-    return 0.0
-
-
-def assess_channel_quality(data, fs):
-    """
-    Assess signal quality for a single channel.
-
-    Returns:
-        quality: float 0-1 (0=bad, 1=good)
-        status: str ('good', 'marginal', 'poor')
-        metrics: dict of computed metrics
-    """
-    metrics = {}
-
-    # Basic variance check
-    variance = np.var(data)
-    metrics["variance"] = variance
-
-    # Check for flat signal (no contact)
-    if variance < QUALITY_THRESHOLDS["variance_min"]:
-        return 0.0, "poor", metrics
-
-    # Check for saturated/clipping signal
-    if variance > QUALITY_THRESHOLDS["variance_max"]:
-        return 0.2, "poor", metrics
-
-    # Compute PSD
-    freqs, psd = compute_psd(data, fs)
-    if freqs is None:
-        return 0.5, "marginal", metrics
-
-    # Spectral slope (1/f characteristic)
-    slope = compute_spectral_slope(freqs, psd)
-    metrics["slope"] = slope
-
-    # High frequency ratio
-    hf_ratio = compute_hf_ratio(freqs, psd)
-    metrics["hf_ratio"] = hf_ratio
-
-    # Line noise
-    line_noise = compute_line_noise_ratio(freqs, psd)
-    metrics["line_noise"] = line_noise
-
-    # Compute quality score
-    score = 0.0
-
-    # Slope scoring (most important - real EEG has 1/f)
-    if slope < QUALITY_THRESHOLDS["slope_good"]:
-        score += 0.5
-    elif slope < QUALITY_THRESHOLDS["slope_marginal"]:
-        score += 0.25
-
-    # Variance in reasonable range
-    if QUALITY_THRESHOLDS["variance_min"] * 10 < variance < QUALITY_THRESHOLDS["variance_max"] / 10:
-        score += 0.2
-    elif QUALITY_THRESHOLDS["variance_min"] < variance < QUALITY_THRESHOLDS["variance_max"]:
-        score += 0.1
-
-    # Low high-frequency content
-    if hf_ratio < QUALITY_THRESHOLDS["hf_ratio_max"] / 2:
-        score += 0.2
-    elif hf_ratio < QUALITY_THRESHOLDS["hf_ratio_max"]:
-        score += 0.1
-
-    # Low line noise
-    if line_noise < QUALITY_THRESHOLDS["line_noise_max"] / 2:
-        score += 0.1
-    elif line_noise < QUALITY_THRESHOLDS["line_noise_max"]:
-        score += 0.05
-
-    # Determine status
-    if score >= 0.7:
-        status = "good"
-    elif score >= 0.4:
-        status = "marginal"
-    else:
-        status = "poor"
-
-    return min(score, 1.0), status, metrics
-
-
-def get_quality_color(quality, status):
-    """Return color based on quality score."""
-    if status == "good":
-        return "#2ecc71"  # Green
-    elif status == "marginal":
-        return "#f1c40f"  # Yellow
-    else:
-        return "#e74c3c"  # Red
-
 
 def main():
     # Connect to EEG stream
     print("Searching for EEG stream...")
     s = find_eeg_stream()
-    inlet_eeg = StreamInlet(s, max_buflen=60)
+    # Small buffer to prevent lag accumulation
+    inlet_eeg = StreamInlet(s, max_buflen=2)
 
     info = inlet_eeg.info()
     fs = float(info.nominal_srate())
@@ -213,8 +63,8 @@ def main():
     buf_len = int(fs * window_s)
     buffers = [deque(maxlen=buf_len) for _ in range(n_eeg)]
 
-    # Quality history for smoothing
-    quality_history = [deque(maxlen=10) for _ in range(n_eeg)]
+    # Quality history for smoothing (30 frames @ 200ms = 6 seconds)
+    quality_history = [deque(maxlen=15) for _ in range(n_eeg)]
 
     # Notch filter for 50Hz (common in many regions)
     notch_freq = 50.0
@@ -332,10 +182,12 @@ def main():
     def update(_frame):
         nonlocal notch_states
 
-        # Pull new samples
-        chunk, _ = inlet_eeg.pull_chunk(timeout=0.0, max_samples=int(fs * 0.1))
-
-        if chunk:
+        # Pull ALL available samples to prevent lag accumulation
+        # Keep pulling until buffer is drained
+        while True:
+            chunk, _ = inlet_eeg.pull_chunk(timeout=0.0, max_samples=256)
+            if not chunk:
+                break
             chunk = np.array(chunk)
             for i in range(n_eeg):
                 if i < chunk.shape[1]:
@@ -361,8 +213,8 @@ def main():
             # Smoothed quality
             smooth_quality = np.mean(quality_history[i])
 
-            # Update electrode circle color
-            color = get_quality_color(smooth_quality, status)
+            # Update electrode circle color (based on smoothed quality)
+            color = get_quality_color(smooth_quality)
             electrode_circles[i].set_facecolor(color)
             quality_texts[i].set_text(f"{int(smooth_quality * 100)}%")
 
@@ -379,17 +231,18 @@ def main():
             wave_lines[i].set_color(color)
 
             # Update PSD
-            freqs, psd = compute_psd(data, fs)
-            if freqs is not None:
+            if len(data) >= fs:
+                freqs, psd = welch(data, fs=fs, nperseg=min(len(data), int(fs * 2)))
                 psd_db = 10 * np.log10(psd + 1e-12)
                 psd_lines[i].set_data(freqs, psd_db)
 
-            # Build status line
+            # Build status line (derive status from smoothed quality)
             label = ch_labels[i] if i < len(ch_labels) else f"Ch{i}"
+            smooth_status = "GOOD" if smooth_quality >= 0.7 else "MARGINAL" if smooth_quality >= 0.4 else "POOR"
             slope_str = f"{metrics.get('slope', 0):.2f}" if 'slope' in metrics else "N/A"
             var_str = f"{metrics.get('variance', 0):.1f}"
             status_lines.append(
-                f"{label}: {status.upper():8s} (q={smooth_quality:.0%}, "
+                f"{label}: {smooth_status:8s} (q={smooth_quality:.0%}, "
                 f"slope={slope_str}, var={var_str})"
             )
 
@@ -398,8 +251,8 @@ def main():
 
         return wave_lines + psd_lines + list(electrode_circles.values())
 
-    # Run animation
-    ani = FuncAnimation(fig, update, interval=100, blit=False, cache_frame_data=False)
+    # Run animation (200ms interval - slower updates but no lag)
+    ani = FuncAnimation(fig, update, interval=200, blit=False, cache_frame_data=False)
 
     plt.tight_layout(rect=[0, 0.08, 1, 0.95])
 
