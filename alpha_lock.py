@@ -5,7 +5,7 @@ from collections import deque
 import numpy as np
 import matplotlib.pyplot as plt
 from pylsl import StreamInlet, resolve_streams
-from scipy.signal import butter, lfilter, welch, lfilter_zi
+from scipy.signal import butter, lfilter, welch, lfilter_zi, iirnotch
 from utils import find_eeg_stream, butter_bandpass, bandpower_welch
 
 def beep(f_hz=880, ms=20):
@@ -53,8 +53,8 @@ class AlphaPLL:
         fs,
         center_hz=10.0,
         iq_lp_hz=2.0,     # low-pass cutoff for I/Q smoothing (Hz)
-        kp=150.0,         # proportional gain (tune)
-        ki=5000.0,        # integral gain (tune)
+        kp=15.0,         # proportional gain (tune)
+        ki=500.0,        # integral gain (tune)
     ):
         self.fs = float(fs)
         self.center_hz = float(center_hz)
@@ -74,6 +74,7 @@ class AlphaPLL:
         self.iq_a = math.exp(-2.0 * math.pi * float(iq_lp_hz) / self.fs)
         self.i_lp = 0.0
         self.q_lp = 0.0
+        self.x2_lp = 0.0   # smoothed x² for amplitude normalization
 
     def step(self, x):
         """
@@ -87,10 +88,11 @@ class AlphaPLL:
         i = x * c
         q = x * s
 
-        # Low-pass I/Q
+        # Low-pass I/Q and signal power (same smoothing constant)
         a = self.iq_a
         self.i_lp = a * self.i_lp + (1.0 - a) * i
         self.q_lp = a * self.q_lp + (1.0 - a) * q
+        self.x2_lp = a * self.x2_lp + (1.0 - a) * (x * x)
 
         # Phase error estimate:
         # If perfectly aligned with cos(), Q should be ~0. Use atan2 for robustness.
@@ -104,8 +106,15 @@ class AlphaPLL:
         omega_correction = (self.kp * err) + (self.ki * self.int_err)
         omega = (2.0 * math.pi * self.center_hz) + omega_correction
 
-        # Keep omega within a sane alpha-ish range (prevents runaway on garbage input)
-        omega = float(np.clip(omega, 2.0 * math.pi * 6.0, 2.0 * math.pi * 14.0))
+        # Tight guard rails around current center (outer loop sets center_hz)
+        omega_min = 2.0 * math.pi * (self.center_hz - 1.5)
+        omega_max = 2.0 * math.pi * (self.center_hz + 1.5)
+        omega = float(np.clip(omega, omega_min, omega_max))
+
+        # Anti-windup: if clamped, back-calculate integrator to stay at the limit
+        if omega != (2.0 * math.pi * self.center_hz) + omega_correction:
+            self.int_err = (omega - 2.0 * math.pi * self.center_hz - self.kp * err) / self.ki
+
         self.omega = omega
 
         dtheta = self.omega * dt
@@ -114,8 +123,11 @@ class AlphaPLL:
 
         inst_freq_hz = self.omega / (2.0 * math.pi)
 
-        # A crude "lock metric": magnitude of baseband vector (bigger tends to mean more coherent)
-        lock_metric = math.sqrt(self.i_lp * self.i_lp + self.q_lp * self.q_lp)
+        # Lock metric: I/Q magnitude normalized by signal RMS → 0..1
+        # 1.0 = perfect sinusoid at NCO frequency, 0.0 = no coherent component
+        iq_mag = math.sqrt(self.i_lp * self.i_lp + self.q_lp * self.q_lp)
+        x_rms = math.sqrt(self.x2_lp) if self.x2_lp > 0.0 else 1e-12
+        lock_metric = min(iq_mag / x_rms, 1.0)
 
         return self.theta_unwrapped, inst_freq_hz, err, lock_metric
 
@@ -139,22 +151,28 @@ def main():
     # Muse via BlueMuse often has 5 channels (4 EEG + REF). Use first 4.
     use_ch = list(range(min(4, ch)))
 
-    # Buffer used to re-evaluate "best" channel
-    window_seconds = 4
+    # Creating a notch at 50 Hz to remove mains hum
+    b50, a50 = iirnotch(w0=50.0, Q=30.0, fs=fs)
+    zi50_0 = lfilter_zi(b50, a50) * 0.0
+    zi50_by_ch = {c: zi50_0.copy() for c in use_ch}
+
+    # Buffer used to re-evaluate "best" channel + estimate IAF
+    window_seconds = 10
     buf_len = fs * window_seconds
     buffers = [deque(maxlen=buf_len) for _ in use_ch]
 
     # Bandpass for alpha tracking (streamed)
     b, a = butter_bandpass(8.0, 12.0, fs, order=4)
-    zi = lfilter_zi(b, a) * 0.0  # bandpass filter state
+    zi0 = lfilter_zi(b, a) * 0.0
+    zi_by_ch = {c: zi0.copy() for c in use_ch}
 
     # PLL settings
     pll = AlphaPLL(
         fs=fs,
         center_hz=10.0,
-        iq_lp_hz=2.0,
-        kp=150.0,
-        ki=5000.0,
+        iq_lp_hz=1.0,      # tighter I/Q smoothing → less noise into loop
+        kp=4.0,             # gentle proportional — won't overshoot to rail
+        ki=40.0,            # slow integrator — tracks drift, not noise
     )
 
     # Beep timing settings
@@ -174,7 +192,7 @@ def main():
     # -------------------------
     # Real-time plot (5s window): PLL input (xf) + internal cos()
     # -------------------------
-    plot_window_s = 5.0
+    plot_window_s = 3.0
     plot_len = int(fs * plot_window_s)
     sig_plot = deque(maxlen=plot_len)   # xf (filtered EEG fed into PLL)
     nco_plot = deque(maxlen=plot_len)   # cos(theta) (PLL internal reference)
@@ -195,7 +213,7 @@ def main():
     ax1.legend(lines, [l.get_label() for l in lines], loc="upper right")
 
     last_plot = time.time()
-    plot_every_s = 0.05  # ~20 Hz UI refresh
+    plot_every_s = 0.5  # ~20 Hz UI refresh
 
     print("Buffering initial data...")
 
@@ -215,8 +233,16 @@ def main():
             # Use current sample from best channel (raw)
             x = float(sample[best_channel])
 
-            # --- streaming bandpass: one-sample update, no tail refiltering ---
-            xf_arr, zi = lfilter(b, a, np.array([x], dtype=np.float64), zi=zi)
+            # 50 Hz notch (streaming, per-channel state)
+            x_arr, zi50_by_ch[best_channel] = lfilter(
+                b50, a50, np.array([x], dtype=np.float64), zi=zi50_by_ch[best_channel]
+            )
+            x = float(x_arr[0])
+
+            # Bandpass 8-12 Hz (streaming, per-channel state)
+            xf_arr, zi_by_ch[best_channel] = lfilter(
+                b, a, np.array([x], dtype=np.float64), zi=zi_by_ch[best_channel]
+            )
             xf = float(xf_arr[0])
 
             # PLL step uses filtered sample
@@ -225,13 +251,14 @@ def main():
             # Perf counter
             n_samples += 1
             if time.time() - t0 >= 1.0:
-                print("processed_hz≈", n_samples / (time.time() - t0))
+                # print("processed_hz≈", n_samples / (time.time() - t0))
                 n_samples = 0
                 t0 = time.time()
 
             # Record for plotting
             sig_plot.append(xf)
-            nco_plot.append(math.cos(pll.theta))
+            nco_plot.append(math.cos(pll.theta) * 0.25)  # Scaling
+
 
             # Set first target just ahead
             if next_target is None:
@@ -265,25 +292,37 @@ def main():
 
                 ax2.set_ylim(-1.1, 1.1)
 
-                fig.canvas.draw()
-                fig.canvas.flush_events()
+                fig.canvas.draw_idle()
                 plt.pause(0.001)
 
-        # Reselect best channel every few seconds (alpha ratio in 8–12 vs 1–30)
+        # Reselect best channel + estimate IAF every few seconds
         now = time.time()
         if now - last_reselect >= reselect_every_s and all(len(buf) >= buf_len for buf in buffers):
             last_reselect = now
             ratios = []
             for buf in buffers:
                 xw = np.asarray(buf, dtype=np.float64)
-                x_alpha = lfilter(b, a, xw)  # fine (only every few seconds)
-                alpha_p = bandpower_welch(x_alpha, fs, 8.0, 12.0)
+                alpha_p = bandpower_welch(xw, fs, 8.0, 12.0)
                 total_p = bandpower_welch(xw, fs, 1.0, 30.0)
                 ratios.append(alpha_p / total_p if total_p > 0 else 0.0)
 
             best_idx = int(np.argmax(ratios))
             best_channel = use_ch[best_idx]
-            print(f"best_ch=ch{best_channel}  pll_f≈{pll.omega/(2*math.pi):.2f}Hz  lock≈{pll.i_lp*pll.i_lp+pll.q_lp*pll.q_lp:.6f}")
+
+            # Estimate IAF: peak frequency in 8-12 Hz from best channel's 10s buffer
+            xw = np.asarray(buffers[best_idx], dtype=np.float64)
+            freqs, psd = welch(xw, fs=fs, nperseg=min(len(xw), fs * 4), noverlap=fs * 2)
+            alpha_mask = (freqs >= 8.0) & (freqs <= 12.0)
+            if np.any(alpha_mask):
+                peak_idx = np.argmax(psd[alpha_mask])
+                iaf = float(freqs[alpha_mask][peak_idx])
+                # Recenter PLL on the detected IAF
+                pll.center_hz = iaf
+
+            iq_mag = math.sqrt(pll.i_lp**2 + pll.q_lp**2)
+            x_rms = math.sqrt(pll.x2_lp) if pll.x2_lp > 0 else 1e-12
+            lock_norm = min(iq_mag / x_rms, 1.0)
+            print(f"best_ch=ch{best_channel}  iaf≈{pll.center_hz:.2f}Hz  pll_f≈{pll.omega/(2*math.pi):.2f}Hz  lock≈{lock_norm:.3f}")
 
 
 if __name__ == "__main__":
