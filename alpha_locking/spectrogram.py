@@ -111,6 +111,114 @@ def compute_mean_psd(data_1ch, fs, f_min=0, f_max=30, bw=0.5, step=0.1):
     return centers, mean_db
 
 
+def compute_best_channel_spectrogram(specs, period_s=3.0):
+    """Build a composite spectrogram by picking the best-alpha channel per period.
+
+    For each *period_s*-second block, selects the channel with the highest
+    alpha (8-12 Hz) to total power ratio, then splices that channel's
+    spectrogram columns into the output.
+
+    Parameters
+    ----------
+    specs : list of (times, freqs, power_dB)
+        Per-channel spectrograms from compute_spectrogram().
+    period_s : float
+        Selection period in seconds.
+
+    Returns
+    -------
+    composite_dB : ndarray, shape (n_freqs, n_times)
+        Composite spectrogram in dB.
+    best_per_col : ndarray, shape (n_times,)
+        Which channel was selected for each time column.
+    """
+    times = specs[0][0]
+    freqs = specs[0][1]
+    n_times = len(times)
+    n_channels = len(specs)
+
+    # Stack all channels: (n_channels, n_freqs, n_times)
+    all_dB = np.stack([s[2] for s in specs], axis=0)
+
+    # Convert to linear for ratio computation
+    all_linear = 10 ** (all_dB / 10)
+
+    alpha_mask = (freqs >= 8) & (freqs <= 12)
+    total_mask = (freqs >= 1) & (freqs <= 30)
+
+    composite_dB = np.empty_like(all_dB[0])
+    best_per_col = np.empty(n_times, dtype=int)
+
+    # Group columns into periods
+    t0 = times[0]
+    period_start = t0
+    col = 0
+    while col < n_times:
+        # Find columns in this period
+        period_end = period_start + period_s
+        block_mask = (times >= period_start) & (times < period_end)
+        if not np.any(block_mask):
+            period_start = period_end
+            continue
+
+        block_idx = np.where(block_mask)[0]
+
+        # Compute alpha:total ratio per channel for this block
+        best_ratio, best_ch = -1.0, 0
+        for ch in range(n_channels):
+            block_power = all_linear[ch][:, block_idx]  # (n_freqs, n_block)
+            alpha_power = block_power[alpha_mask, :].sum()
+            total_power = block_power[total_mask, :].sum() + 1e-20
+            ratio = alpha_power / total_power
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_ch = ch
+
+        composite_dB[:, block_idx] = all_dB[best_ch][:, block_idx]
+        best_per_col[block_idx] = best_ch
+
+        period_start = period_end
+        col = block_idx[-1] + 1
+
+    return composite_dB, best_per_col
+
+
+def compute_mean_psd_from_spectrogram(freqs, power_dB, f_min=0, f_max=30,
+                                      bw=0.5, step=0.1):
+    """Rolling mean PSD from a spectrogram's time-averaged power.
+
+    Like compute_mean_psd but works from spectrogram data directly (used
+    for the composite best-channel panel).
+
+    Parameters
+    ----------
+    freqs : ndarray
+        Spectrogram frequency axis (Hz).
+    power_dB : ndarray, shape (n_freqs, n_times)
+        Spectrogram power in dB.
+    f_min, f_max, bw, step : float
+        Same as compute_mean_psd.
+
+    Returns
+    -------
+    centers, mean_db : ndarrays
+    """
+    raw_mean = power_dB.mean(axis=1)  # average dB across time
+
+    half = bw / 2
+    centers = np.arange(f_min, f_max + step / 2, step)
+    mean_db = np.empty(len(centers))
+    for i, fc in enumerate(centers):
+        mask = (freqs >= fc - half) & (freqs <= fc + half)
+        if np.any(mask):
+            mean_db[i] = raw_mean[mask].mean()
+        else:
+            idx = np.argmin(np.abs(freqs - fc))
+            mean_db[i] = raw_mean[idx]
+
+    return centers, mean_db
+
+
 def plot_spectrogram(recording, f_min=0, f_max=30):
     """Plot spectrograms for all channels with interactive sliders.
 
@@ -140,6 +248,9 @@ def plot_spectrogram(recording, f_min=0, f_max=30):
         times, freqs, power_dB = compute_spectrogram(data[ch], fs, f_min, f_max)
         specs.append((times, freqs, power_dB))
 
+    # Composite best-channel spectrogram
+    composite_dB, best_per_col = compute_best_channel_spectrogram(specs)
+
     # Global colour limits so all channels share the same scale
     all_power = np.concatenate([s[2].ravel() for s in specs])
     vmin = np.percentile(all_power, 5)
@@ -148,8 +259,9 @@ def plot_spectrogram(recording, f_min=0, f_max=30):
     total_duration = times[-1]
     default_window = min(10.0, total_duration)
 
-    # --- Figure layout ---
-    fig = plt.figure(figsize=(16, 10))
+    # --- Figure layout (5 panels: 4 channels + composite) ---
+    n_panels = n_channels + 1
+    fig = plt.figure(figsize=(16, 12))
     fig.suptitle(
         f"Spectrogram: {recording.get('recording_name', '')}",
         fontsize=12, fontweight="bold",
@@ -158,70 +270,85 @@ def plot_spectrogram(recording, f_min=0, f_max=30):
     axes = []       # spectrogram axes
     psd_axes = []   # mean-PSD side axes
     meshes = []
-    panel_height = 0.15
-    panel_gap = 0.17
+    panel_height = 0.115
+    panel_gap = 0.14
+    bottom_start = 0.22
     spec_width = 0.68
     psd_width = 0.12
-    psd_left = 0.08 + spec_width + 0.01  # small gap between spectrogram and PSD
+    psd_left = 0.08 + spec_width + 0.01
 
-    for i in range(n_channels):
-        bottom = 0.28 + (n_channels - 1 - i) * panel_gap
+    panel_labels = list(labels) + ["Best \u03b1"]
 
-        # Spectrogram panel
+    def _add_psd_panel(ax, ax_bottom, psd_freqs, mean_psd, is_last):
+        """Add a mean-PSD side panel with alpha peak marker."""
+        ax_psd = fig.add_axes([psd_left, ax_bottom, psd_width, panel_height],
+                              sharey=ax)
+        ax_psd.plot(mean_psd, psd_freqs, color="white", lw=1.2)
+        ax_psd.fill_betweenx(psd_freqs, vmin, mean_psd, alpha=0.3, color="cyan")
+        ax_psd.set_xlim(vmin, vmax)
+        ax_psd.set_facecolor("#1a1a2e")
+        ax_psd.tick_params(labelleft=False)
+        if not is_last:
+            ax_psd.set_xticklabels([])
+        else:
+            ax_psd.set_xlabel("dB", fontsize=8)
+
+        # Flag alpha peak (8-12 Hz)
+        a_mask = (psd_freqs >= 8) & (psd_freqs <= 12)
+        if np.any(a_mask):
+            a_freqs = psd_freqs[a_mask]
+            a_psd = mean_psd[a_mask]
+            pk = np.argmax(a_psd)
+            ax_psd.plot(a_psd[pk], a_freqs[pk], "ro", ms=6, zorder=5)
+            ax_psd.annotate(
+                f"{a_freqs[pk]:.1f} Hz",
+                xy=(a_psd[pk], a_freqs[pk]),
+                xytext=(8, 0), textcoords="offset points",
+                fontsize=7, color="red", fontweight="bold",
+                va="center",
+            )
+        ax_psd.axhspan(8, 12, alpha=0.15, color="red")
+        return ax_psd
+
+    for i in range(n_panels):
+        bottom = bottom_start + (n_panels - 1 - i) * panel_gap
+        is_last = (i == n_panels - 1)
+
         ax = fig.add_axes([0.08, bottom, spec_width, panel_height])
-        t, f, pdb = specs[i]
-        mesh = ax.pcolormesh(t, f, pdb, shading="gouraud", cmap="viridis",
-                             vmin=vmin, vmax=vmax)
-        ax.set_ylabel(f"{labels[i]}\nFreq (Hz)", fontsize=9)
-        if i < n_channels - 1:
+
+        if i < n_channels:
+            # Regular channel
+            t, f, pdb = specs[i]
+            mesh = ax.pcolormesh(t, f, pdb, shading="gouraud", cmap="viridis",
+                                 vmin=vmin, vmax=vmax)
+            psd_freqs, mean_psd = compute_mean_psd(
+                data[i], fs, f_min, f_max, bw=0.5, step=0.1,
+            )
+        else:
+            # Composite best-channel panel
+            f = specs[0][1]
+            t = specs[0][0]
+            mesh = ax.pcolormesh(t, f, composite_dB, shading="gouraud",
+                                 cmap="viridis", vmin=vmin, vmax=vmax)
+            psd_freqs, mean_psd = compute_mean_psd_from_spectrogram(
+                f, composite_dB, f_min, f_max, bw=0.5, step=0.1,
+            )
+
+        ax.set_ylabel(f"{panel_labels[i]}\nFreq (Hz)", fontsize=9)
+        if not is_last:
             ax.set_xticklabels([])
         else:
             ax.set_xlabel("Time (s)")
         axes.append(ax)
         meshes.append(mesh)
 
-        # Mean PSD side panel (rolling 0.5 Hz windows at 0.1 Hz steps)
-        ax_psd = fig.add_axes([psd_left, bottom, psd_width, panel_height],
-                              sharey=ax)
-        psd_freqs, mean_psd = compute_mean_psd(
-            data[i], fs, f_min, f_max, bw=0.5, step=0.1,
-        )
-        ax_psd.plot(mean_psd, psd_freqs, color="white", lw=1.2)
-        ax_psd.fill_betweenx(psd_freqs, vmin, mean_psd, alpha=0.3, color="cyan")
-        ax_psd.set_xlim(vmin, vmax)
-        ax_psd.set_facecolor("#1a1a2e")
-        ax_psd.tick_params(labelleft=False)
-        if i < n_channels - 1:
-            ax_psd.set_xticklabels([])
-        else:
-            ax_psd.set_xlabel("dB", fontsize=8)
-
-        # Flag alpha peak (8-12 Hz)
-        alpha_mask = (psd_freqs >= 8) & (psd_freqs <= 12)
-        if np.any(alpha_mask):
-            alpha_freqs = psd_freqs[alpha_mask]
-            alpha_psd = mean_psd[alpha_mask]
-            peak_idx = np.argmax(alpha_psd)
-            peak_freq = alpha_freqs[peak_idx]
-            peak_db = alpha_psd[peak_idx]
-            ax_psd.plot(peak_db, peak_freq, "ro", ms=6, zorder=5)
-            ax_psd.annotate(
-                f"{peak_freq:.1f} Hz",
-                xy=(peak_db, peak_freq),
-                xytext=(8, 0), textcoords="offset points",
-                fontsize=7, color="red", fontweight="bold",
-                va="center",
-            )
-
-        # Shade alpha band background
-        ax_psd.axhspan(8, 12, alpha=0.15, color="red")
-
+        ax_psd = _add_psd_panel(ax, bottom, psd_freqs, mean_psd, is_last)
         psd_axes.append(ax_psd)
 
     # Colour bar
     cbar_left = psd_left + psd_width + 0.015
-    cbar_ax = fig.add_axes([cbar_left, 0.28, 0.012,
-                            panel_gap * n_channels - 0.02])
+    cbar_ax = fig.add_axes([cbar_left, bottom_start, 0.012,
+                            panel_gap * n_panels - 0.02])
     fig.colorbar(meshes[0], cax=cbar_ax, label="Power (dB)")
 
     # --- Sliders ---
