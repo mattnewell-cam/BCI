@@ -1,12 +1,12 @@
 """
-Lock Live 2 - Sinusoid-fit based alpha phase tracking with audio feedback.
+Lock Live 2 - Trough-tracking alpha phase prediction with audio feedback.
 
-Every 300ms, fits a sinusoid to the last 400ms of continuously-bandpassed
-EEG (using 1000ms of filter warm-up), projects forward, and schedules
-beeps at the next 3 troughs (skipping the very first projected trough).
+Every 100ms, pulls the last 1000ms of raw EEG, bandpass-filters it in one
+shot, finds the last 3 troughs, averages the two inter-trough gaps to get
+the period, and projects forward to schedule a beep at the 2nd predicted
+trough.
 
-On the first 3 fitting rounds, captures diagnostic data and saves a
-validation plot to media/.
+Includes per-step timing diagnostics printed every 10th round.
 
 Usage:
     python lock_live_2.py
@@ -21,102 +21,73 @@ from collections import deque
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
-from scipy.signal import butter, sosfilt, sosfilt_zi
+import sounddevice as sd
+from scipy.signal import butter, sosfilt, argrelmin
 from pylsl import StreamInlet
 
 from utils import find_eeg_stream
-from alpha_lock_logic import beep
 
 CHANNEL_LABELS = ["AF7", "AF8", "TP9", "TP10"]
 
-# --- Filter parameters (hardcoded for now) ---
+# --- Filter parameters ---
 BAND_LO = 8.3
 BAND_HI = 10.3
 FILTER_ORDER = 4
-FIT_FREQ_LO = 8.8
-FIT_FREQ_HI = 9.8
-FIT_FREQ_STEP = 0.02
 
 # --- Timing ---
-FIT_INTERVAL_S = 0.300   # refit every 300ms
-FIT_WINDOW_S = 0.400     # fit sinusoid to last 400ms
-LOOKBACK_S = 1.000       # bandpassed buffer needed (warm-up + fit window)
+FIT_INTERVAL_S = 0.100   # refit every 100ms
+LOOKBACK_S = 1.000       # bandpass this window each round
 BEEP_FREQ_HZ = 880
 BEEP_MS = 15
 
-# --- Diagnostics ---
-N_DIAGNOSTIC_ROUNDS = 3
-DIAGNOSTIC_FUTURE_S = 0.400  # extra data to capture after fit
+# --- Audio (sounddevice) ---
+AUDIO_FS = 48000
+BEEP_SAMPLES = int(AUDIO_FS * BEEP_MS / 1000)
+BEEP_AMP = 0.2
+
+# Precompute one beep waveform
+_t = np.arange(BEEP_SAMPLES) / AUDIO_FS
+BEEP_WAV = (BEEP_AMP * np.sin(2 * np.pi * BEEP_FREQ_HZ * _t)).astype(np.float32)
+
+_events = deque()
+_events_lock = threading.Lock()
+_stream_sample = 0
 
 
-# ---------------------------------------------------------------------------
-# Sinusoid fitting (same as alpha_lock_sections)
-# ---------------------------------------------------------------------------
-
-def fit_sinusoid(signal_section, fs, freq_lo, freq_hi, freq_step):
-    """Fit A*sin(2*pi*f*t + phi), grid-searching frequency for best RMSE.
-
-    Fully vectorized across all candidate frequencies — no Python loop.
-    """
-    n = len(signal_section)
-    t = np.arange(n) / fs
-    freqs = np.arange(freq_lo, freq_hi + freq_step / 2, freq_step)
-
-    # (n_freqs, n_samples)
-    wt = np.outer(2 * np.pi * freqs, t)
-    S = np.sin(wt)
-    C = np.cos(wt)
-
-    # Normal equations for [a, b] in y = a*sin + b*cos
-    ss = np.sum(S * S, axis=1)
-    cc = np.sum(C * C, axis=1)
-    sc = np.sum(S * C, axis=1)
-    sy = S @ signal_section
-    cy = C @ signal_section
-
-    det = ss * cc - sc * sc
-    a = (cc * sy - sc * cy) / det
-    b = (ss * cy - sc * sy) / det
-
-    # RMSE via analytic expansion (avoids building residual matrix)
-    yy = np.dot(signal_section, signal_section) / n
-    mse = yy - 2 * (a * sy + b * cy) / n + (a * a * ss + 2 * a * b * sc + b * b * cc) / n
-    rmse = np.sqrt(np.maximum(mse, 0.0))
-
-    best_idx = np.argmin(rmse)
-    best_f = freqs[best_idx]
-    amplitude = np.sqrt(a[best_idx] ** 2 + b[best_idx] ** 2)
-    phase = np.arctan2(b[best_idx], a[best_idx])
-    return best_f, amplitude, phase, float(rmse[best_idx])
+def schedule_beep(delay_s=0.0):
+    """Schedule a beep to play delay_s seconds from now in the audio stream."""
+    global _stream_sample
+    with _events_lock:
+        start = _stream_sample + int(delay_s * AUDIO_FS)
+        _events.append(start)
 
 
-def synth_sinusoid(t, freq, amplitude, phase):
-    """Generate A*sin(2*pi*f*t + phi)."""
-    return amplitude * np.sin(2 * np.pi * freq * t + phase)
+def _audio_callback(outdata, frames, time_info, status):
+    global _stream_sample
+    out = np.zeros(frames, np.float32)
 
+    with _events_lock:
+        block_start = _stream_sample
+        block_end = _stream_sample + frames
 
-def find_troughs(freq, amplitude, phase, t_start, n_troughs=4):
-    """Find the next n trough times after t_start.
+        # drop events that are already finished
+        while _events and _events[0] + BEEP_SAMPLES <= block_start:
+            _events.popleft()
 
-    Trough of A*sin(2*pi*f*t + phi) occurs when 2*pi*f*t + phi = -pi/2 + 2*pi*k.
-    So t = (-pi/2 - phi + 2*pi*k) / (2*pi*f).
-    """
-    w = 2 * np.pi * freq
-    troughs = []
-    # Start searching from a k that puts us near t_start
-    k_start = int(np.floor((w * t_start + phase + np.pi / 2) / (2 * np.pi)))
-    for k in range(k_start, k_start + n_troughs + 5):
-        t_trough = (-np.pi / 2 - phase + 2 * np.pi * k) / w
-        if t_trough > t_start:
-            troughs.append(t_trough)
-            if len(troughs) == n_troughs:
-                break
-    return troughs
+        for start in list(_events):
+            end = start + BEEP_SAMPLES
+            if end <= block_start or start >= block_end:
+                continue
+            # overlap region
+            a0 = max(0, block_start - start)
+            a1 = min(BEEP_SAMPLES, block_end - start)
+            o0 = max(0, start - block_start)
+            o1 = o0 + (a1 - a0)
+            out[o0:o1] += BEEP_WAV[a0:a1]
 
+    outdata[:, 0] = out
+    _stream_sample += frames
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main():
     # Connect to EEG stream
@@ -129,226 +100,117 @@ def main():
     n_eeg = min(4, n_channels)
     print(f"Connected: fs={fs} Hz, channels={n_eeg}, name={info.name()}")
 
-    # --- Bandpass filter (continuous, state-preserving) ---
+    # --- Bandpass filter (designed once, applied fresh each round) ---
     sos = butter(FILTER_ORDER, [BAND_LO, BAND_HI], btype="band",
                  fs=fs, output="sos")
-    zi = sosfilt_zi(sos)
-    # One filter state per channel
-    filter_states = [zi.copy() for _ in range(n_eeg)]
 
-    # Ring buffers: raw and filtered (per channel)
-    # Need enough to hold all data from round 8 through plot time (~5s margin)
-    buf_len = int(10.0 * fs)
+    # Ring buffer for raw samples (per channel)
+    buf_len = int(3.0 * fs)  # 3s is plenty
     raw_bufs = [deque(maxlen=buf_len) for _ in range(n_eeg)]
-    filt_bufs = [deque(maxlen=buf_len) for _ in range(n_eeg)]
 
     # --- Channel selection ---
-    # For now, use channel 3 (TP10) as default; could add auto-selection later
     best_ch = 3 if n_eeg > 3 else 0
-
-    # --- Beep scheduling ---
-    pending_timers = []
-
-    def schedule_beep(delay_s):
-        """Schedule a beep delay_s seconds from now."""
-        if delay_s < 0.005:
-            return  # too close, skip
-        t = threading.Timer(delay_s, beep, args=[BEEP_FREQ_HZ, BEEP_MS])
-        t.daemon = True
-        t.start()
-        pending_timers.append(t)
-
-    # --- Diagnostic capture (rounds 8-10) ---
-    DIAG_START_ROUND = 8   # 1-indexed: capture rounds 8, 9, 10
-    diagnostics = []
-    fit_round = 0
 
     # --- Timing ---
     sample_count = 0
-    t0_wall = time.time()  # wall clock at start
+    t0_wall = time.time()
     last_fit_time = 0.0
-    min_samples_for_fit = int(LOOKBACK_S * fs)
+    lookback_samples = int(LOOKBACK_S * fs)
+    fit_round = 0
 
-    print(f"Filter: {BAND_LO}-{BAND_HI} Hz, fit range: {FIT_FREQ_LO}-{FIT_FREQ_HI} Hz")
+    last_fit_wall = None  # perf_counter at last fit, for measuring true interval
+
+    print(f"Filter: {BAND_LO}-{BAND_HI} Hz, interval: {FIT_INTERVAL_S*1000:.0f}ms")
     print(f"Buffering {LOOKBACK_S}s before first fit...")
+
+    # Open persistent low-latency audio stream for beeps
+    audio_stream = sd.OutputStream(
+        samplerate=AUDIO_FS, channels=1, callback=_audio_callback,
+        dtype="float32", latency="low",
+    )
+    audio_stream.start()
+    schedule_beep(0.0)  # test beep
+    print("Audio stream started (sounddevice)")
 
     while True:
         # --- Pull all available samples ---
-        chunk, timestamps = inlet.pull_chunk(timeout=0.01, max_samples=256)
+        chunk, timestamps = inlet.pull_chunk(timeout=0.0, max_samples=256)
         if chunk:
-            chunk_arr = np.array(chunk)  # (n_samples, n_channels)
+            chunk_arr = np.array(chunk)
             for ch in range(n_eeg):
-                ch_data = chunk_arr[:, ch]
-                filtered, filter_states[ch] = sosfilt(
-                    sos, ch_data, zi=filter_states[ch],
-                )
-                raw_bufs[ch].extend(ch_data)
-                filt_bufs[ch].extend(filtered)
+                raw_bufs[ch].extend(chunk_arr[:, ch])
             sample_count += len(chunk)
 
         # --- Check if time to fit ---
         now_wall = time.time()
         elapsed = now_wall - t0_wall
 
-        if sample_count < min_samples_for_fit:
+        if sample_count < lookback_samples:
             continue
 
-        if elapsed - last_fit_time < FIT_INTERVAL_S:
-            time.sleep(0.005)
+        time_since_fit = elapsed - last_fit_time
+        if time_since_fit < FIT_INTERVAL_S:
             continue
 
+        fit_round += 1
+        now_perf = time.perf_counter()
+        wall_interval = (now_perf - last_fit_wall) * 1000 if last_fit_wall else 0.0
+        last_fit_wall = now_perf
         last_fit_time = elapsed
 
-        # --- Grab last 1000ms of filtered signal, fit last 400ms ---
-        lookback_samples = int(LOOKBACK_S * fs)
-        fit_samples = int(FIT_WINDOW_S * fs)
+        # --- Grab last 1000ms of raw signal and bandpass in one shot ---
+        t_filt_start = time.perf_counter()
+        raw_arr = np.array(raw_bufs[best_ch])
+        window = raw_arr[-lookback_samples:]
+        filtered = sosfilt(sos, window)
+        t_filt = time.perf_counter() - t_filt_start
 
-        filt_arr = np.array(filt_bufs[best_ch])
-        if len(filt_arr) < lookback_samples:
+        # --- Find troughs in the filtered signal ---
+        t_trough_start = time.perf_counter()
+        # argrelmin with order ~ half-cycle at lower band edge
+        half_cycle_samples = max(3, int(fs / BAND_HI / 2))
+        trough_indices = argrelmin(filtered, order=half_cycle_samples)[0]
+
+        if len(trough_indices) < 3:
+            if fit_round % 10 == 0:
+                print(f"[{fit_round}] only {len(trough_indices)} troughs found, skipping")
             continue
 
-        # Last 1000ms of filtered output
-        lookback_chunk = filt_arr[-lookback_samples:]
-        # Last 400ms for fitting
-        fit_chunk = lookback_chunk[-fit_samples:]
+        # Last 3 trough positions (in samples from start of window)
+        last3 = trough_indices[-3:]
+        gap1 = last3[1] - last3[0]
+        gap2 = last3[2] - last3[1]
+        avg_gap = (gap1 + gap2) / 2.0
+        t_trough = time.perf_counter() - t_trough_start
 
-        # --- Fit sinusoid ---
-        # t=0 is the START of the fit window
-        freq, amp, phase, rmse = fit_sinusoid(
-            fit_chunk, fs, FIT_FREQ_LO, FIT_FREQ_HI, FIT_FREQ_STEP,
-        )
+        # --- Project forward from the last trough ---
+        t_sched_start = time.perf_counter()
+        last_trough_sample = last3[2]
+        # How far in the past is the last trough from "now" (end of window)?
+        samples_since_last_trough = lookback_samples - last_trough_sample
+        seconds_since_last_trough = samples_since_last_trough / fs
 
-        # Time reference: t=0 at start of fit window,
-        # t=FIT_WINDOW_S at "now" (end of fit window)
-        t_now = FIT_WINDOW_S  # "now" relative to fit window start
+        # Next trough: one avg_gap after the last trough
+        next1_delay = (avg_gap / fs) - seconds_since_last_trough
+        # Second trough: two avg_gaps after the last trough
+        next2_delay = (2 * avg_gap / fs) - seconds_since_last_trough
 
-        # Find next 4 troughs after "now"
-        troughs = find_troughs(freq, amp, phase, t_now, n_troughs=4)
+        # Schedule beep at the 2nd predicted trough
+        if next2_delay > 0.005:
+            schedule_beep(next2_delay)
+        t_sched = time.perf_counter() - t_sched_start
 
-        # Schedule beeps at troughs 2, 3, 4 (skip trough 1)
-        for trough_t in troughs[1:4]:
-            delay = trough_t - t_now  # seconds from now
-            schedule_beep(delay)
-
-        # Clean up expired timers
-        pending_timers[:] = [t for t in pending_timers if t.is_alive()]
-
-        # --- Console output (every 5th fit to avoid WSL2 print overhead) ---
-        if fit_round % 5 == 0:
-            trough_delays = [f"{(t - t_now)*1000:.0f}ms" for t in troughs[:4]]
-            print(f"fit: {freq:.2f}Hz  amp={amp:.2f}  rmse={rmse:.3f}  "
-                  f"troughs=[{', '.join(trough_delays)}]  "
-                  f"beeps at [{', '.join(trough_delays[1:4])}]")
-
-        # --- Diagnostic capture for rounds 8-10 ---
-        fit_round += 1
-        if DIAG_START_ROUND <= fit_round < DIAG_START_ROUND + N_DIAGNOSTIC_ROUNDS:
-            diagnostics.append({
-                "round": fit_round,
-                "lookback": lookback_chunk.copy(),
-                "freq": freq,
-                "amp": amp,
-                "phase": phase,
-                "rmse": rmse,
-                "fit_samples": fit_samples,
-                "lookback_samples": lookback_samples,
-                "wall_time": now_wall,
-                "buf_end": len(filt_arr),
-            })
-
-            if fit_round == DIAG_START_ROUND + N_DIAGNOSTIC_ROUNDS - 1:
-                # Schedule the diagnostic plot after future data arrives
-                def capture_and_plot():
-                    time.sleep(DIAGNOSTIC_FUTURE_S + 0.2)
-                    _save_diagnostic_plot(diagnostics, filt_bufs[best_ch], fs)
-                t = threading.Thread(target=capture_and_plot, daemon=True)
-                t.start()
-
-
-def _save_diagnostic_plot(diagnostics, filt_buf, fs):
-    """Save diagnostic plot for captured fitting rounds."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    n = len(diagnostics)
-    fig, axes = plt.subplots(n, 1, figsize=(14, 4 * n), sharex=False)
-    if n == 1:
-        axes = [axes]
-
-    filt_arr = np.array(filt_buf)
-
-    for i, diag in enumerate(diagnostics):
-        ax = axes[i]
-
-        lookback_samples = diag["lookback_samples"]
-        fit_samples = diag["fit_samples"]
-        future_samples = int(DIAGNOSTIC_FUTURE_S * fs)
-
-        # (a) Blue: the 1000ms lookback (bandpassed), saved at capture time
-        lookback = diag["lookback"]
-        t_lookback = np.arange(len(lookback)) / fs
-
-        # (b) Green: full 1400ms from the continuous filter buffer
-        # buf_end is the deque length at capture time — avoids race with
-        # sample_count which is read from a different thread.
-        buf_end = diag["buf_end"]
-        start_pos = buf_end - lookback_samples
-        end_pos = min(buf_end + future_samples, len(filt_arr))
-        full_window = filt_arr[start_pos:end_pos]
-        t_full = np.arange(len(full_window)) / fs
-
-        # (c) Red: fitted sinusoid projected across the full 1400ms
-        # Fit's t=0 is the start of the 400ms fit window, which is
-        # (lookback_samples - fit_samples) into the lookback
-        fit_offset_s = (lookback_samples - fit_samples) / fs
-        t_sin_shifted = t_full - fit_offset_s
-        fitted_sin = synth_sinusoid(
-            t_sin_shifted, diag["freq"], diag["amp"], diag["phase"],
-        )
-
-        now_t = lookback_samples / fs
-
-        ax.plot(t_full, full_window, color="green", lw=0.8, alpha=0.7,
-                label="Full 1400ms (bandpassed)")
-        ax.plot(t_lookback, lookback, color="blue", lw=1.0, alpha=0.9,
-                label="1000ms lookback (used)")
-        ax.plot(t_full, fitted_sin, color="red", lw=1.2, alpha=0.8,
-                label=f"Fitted sin: {diag['freq']:.2f}Hz, RMSE={diag['rmse']:.3f}")
-
-        ax.axvline(fit_offset_s, color="gray", ls=":", lw=1,
-                   label="Fit window start")
-        ax.axvline(now_t, color="black", ls="--", lw=1, label='"Now"')
-
-        # Mark projected troughs
-        troughs = find_troughs(
-            diag["freq"], diag["amp"], diag["phase"],
-            FIT_WINDOW_S, n_troughs=4,
-        )
-        for j, tr in enumerate(troughs):
-            tr_plot = tr + fit_offset_s  # convert to plot time
-            if tr_plot <= t_full[-1]:
-                color = "gray" if j == 0 else "orange"
-                ax.axvline(tr_plot, color=color, ls=":", lw=0.8, alpha=0.7)
-                val = synth_sinusoid(np.array([tr]), diag["freq"],
-                                     diag["amp"], diag["phase"])[0]
-                ax.plot(tr_plot, val, "v", color=color, ms=8, zorder=5)
-
-        ax.set_title(f"Round {diag['round']}", fontsize=11)
-        ax.set_ylabel("Amplitude")
-        ax.legend(loc="upper right", fontsize=7)
-
-    axes[-1].set_xlabel("Time (s)")
-    fig.suptitle("Lock Live 2 — Diagnostic: Fit Validation", fontsize=13,
-                 fontweight="bold")
-    fig.tight_layout()
-
-    out_path = os.path.join(os.path.dirname(__file__), "..", "media",
-                            "lock_live_2_diagnostic.png")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    fig.savefig(out_path, dpi=120)
-    print(f"\nDiagnostic plot saved: {out_path}")
-    plt.close(fig)
+        # --- Console output (every 10th round) ---
+        if fit_round % 10 == 0:
+            freq_est = fs / avg_gap
+            print(f"[{fit_round}] freq={freq_est:.1f}Hz  "
+                  f"gaps={gap1},{gap2}  avg={avg_gap:.1f}  "
+                  f"delay={next2_delay*1000:.0f}ms  |  "
+                  f"filt={t_filt*1000:.1f}ms  "
+                  f"trough={t_trough*1000:.1f}ms  "
+                  f"sched={t_sched*1000:.1f}ms  "
+                  f"total={((t_filt+t_trough+t_sched)*1000):.1f}ms  "
+                  f"interval={wall_interval:.0f}ms")
 
 
 if __name__ == "__main__":

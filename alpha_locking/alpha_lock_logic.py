@@ -298,11 +298,41 @@ class AlphaLockProcessor:
         }
 
 
+_BEEP_WAV_CACHE = {}
+
+
+def _make_wav_bytes(freq_hz, duration_ms, sample_rate=44100, volume=0.2):
+    import io
+    import wave
+    import struct
+
+    n = int(sample_rate * duration_ms / 1000.0)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        for i in range(n):
+            t = i / sample_rate
+            sample = int(32767 * volume * math.sin(2 * math.pi * freq_hz * t))
+            wf.writeframes(struct.pack("<h", sample))
+    return buf.getvalue()
+
+
 def beep(f_hz=880, ms=20):
-    """Play a beep sound (cross-platform)."""
+    """Play a beep sound (cross-platform, non-blocking).
+
+    Prefer winsound.PlaySound (async) on Windows to avoid blocking; fall back to
+    simpleaudio, then winsound.Beep if needed.
+    """
     try:
         import winsound
-        winsound.Beep(int(f_hz), int(ms))
+        key = (int(f_hz), int(ms))
+        wav = _BEEP_WAV_CACHE.get(key)
+        if wav is None:
+            wav = _make_wav_bytes(key[0], key[1])
+            _BEEP_WAV_CACHE[key] = wav
+        winsound.PlaySound(wav, winsound.SND_MEMORY | winsound.SND_ASYNC | winsound.SND_NOSTOP)
         return
     except Exception:
         pass
@@ -314,6 +344,13 @@ def beep(f_hz=880, ms=20):
         x = (0.2 * np.sin(2 * np.pi * f_hz * t)).astype(np.float32)
         audio = (x * 32767).astype(np.int16)
         sa.play_buffer(audio, 1, 2, fs)
+        return
+    except Exception:
+        pass
+
+    try:
+        import winsound
+        winsound.Beep(int(f_hz), int(ms))
         return
     except Exception:
         pass
