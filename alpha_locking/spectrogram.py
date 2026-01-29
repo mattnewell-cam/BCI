@@ -220,7 +220,7 @@ def compute_mean_psd_from_spectrogram(freqs, power_dB, f_min=0, f_max=30,
 
 
 def plot_spectrogram(recording, f_min=0, f_max=30):
-    """Plot spectrograms for all channels with interactive sliders.
+    """Plot one spectrogram + PSD at a time; left/right arrows switch channel.
 
     Parameters
     ----------
@@ -234,6 +234,8 @@ def plot_spectrogram(recording, f_min=0, f_max=30):
     fig : matplotlib Figure
     """
     from matplotlib.widgets import Slider
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
 
     data = recording["data"]         # (n_channels, n_samples)
     fs = recording["sample_rate"]
@@ -259,97 +261,68 @@ def plot_spectrogram(recording, f_min=0, f_max=30):
     total_duration = times[-1]
     default_window = min(10.0, total_duration)
 
-    # --- Figure layout (5 panels: 4 channels + composite) ---
+    # Pre-compute PSD for each panel so channel and PSD always match
+    panel_labels = list(labels) + [u"Best \u03b1"]
     n_panels = n_channels + 1
-    fig = plt.figure(figsize=(16, 12))
-    fig.suptitle(
-        f"Spectrogram: {recording.get('recording_name', '')}",
+    psd_data = []
+    for i in range(n_panels):
+        if i < n_channels:
+            pf, mp = compute_mean_psd(
+                data[i], fs, f_min, f_max, bw=0.5, step=0.1)
+        else:
+            pf, mp = compute_mean_psd_from_spectrogram(
+                specs[0][1], composite_dB, f_min, f_max, bw=0.5, step=0.1)
+        psd_data.append((pf, mp))
+
+    # --- Figure layout: single spectrogram + PSD ---
+    fig = plt.figure(figsize=(16, 6))
+    title_text = fig.suptitle(
+        f"Spectrogram: {recording.get('recording_name', '')} "
+        + u"\u2014 " + f"{panel_labels[0]}",
         fontsize=12, fontweight="bold",
     )
 
-    axes = []       # spectrogram axes
-    psd_axes = []   # mean-PSD side axes
-    meshes = []
-    panel_height = 0.115
-    panel_gap = 0.14
-    bottom_start = 0.22
-    spec_width = 0.68
-    psd_width = 0.12
-    psd_left = 0.08 + spec_width + 0.01
+    spec_ax = fig.add_axes([0.08, 0.25, 0.63, 0.60])
+    psd_ax = fig.add_axes([0.73, 0.25, 0.12, 0.60], sharey=spec_ax)
+    cbar_ax = fig.add_axes([0.87, 0.25, 0.015, 0.60])
 
-    panel_labels = list(labels) + ["Best \u03b1"]
+    # Colour bar from a fixed ScalarMappable (independent of mesh lifecycle)
+    sm = ScalarMappable(cmap="viridis", norm=Normalize(vmin=vmin, vmax=vmax))
+    fig.colorbar(sm, cax=cbar_ax, label="Power (dB)")
 
-    def _add_psd_panel(ax, ax_bottom, psd_freqs, mean_psd, is_last):
-        """Add a mean-PSD side panel with alpha peak marker."""
-        ax_psd = fig.add_axes([psd_left, ax_bottom, psd_width, panel_height],
-                              sharey=ax)
-        ax_psd.plot(mean_psd, psd_freqs, color="white", lw=1.2)
-        ax_psd.fill_betweenx(psd_freqs, vmin, mean_psd, alpha=0.3, color="cyan")
-        ax_psd.set_xlim(vmin, vmax)
-        ax_psd.set_facecolor("#1a1a2e")
-        ax_psd.tick_params(labelleft=False)
-        if not is_last:
-            ax_psd.set_xticklabels([])
-        else:
-            ax_psd.set_xlabel("dB", fontsize=8)
+    # Placeholder mesh (immediately replaced by first update())
+    t0, f0, p0 = specs[0]
+    mesh = [spec_ax.pcolormesh(t0[:2], f0, p0[:, :2], shading="gouraud",
+                               cmap="viridis", vmin=vmin, vmax=vmax)]
 
-        # Flag alpha peak (8-12 Hz)
-        a_mask = (psd_freqs >= 8) & (psd_freqs <= 12)
+    current_panel = [0]
+    t_full = specs[0][0]
+
+    def draw_psd(panel_idx):
+        """Redraw the PSD side-panel for the given channel."""
+        psd_ax.clear()
+        pf, mp = psd_data[panel_idx]
+        psd_ax.plot(mp, pf, color="white", lw=1.2)
+        psd_ax.fill_betweenx(pf, vmin, mp, alpha=0.3, color="cyan")
+        psd_ax.set_xlim(vmin, vmax)
+        psd_ax.set_facecolor("#1a1a2e")
+        psd_ax.tick_params(labelleft=False)
+        psd_ax.set_xlabel("dB", fontsize=8)
+
+        # Alpha peak marker (8-12 Hz)
+        a_mask = (pf >= 8) & (pf <= 12)
         if np.any(a_mask):
-            a_freqs = psd_freqs[a_mask]
-            a_psd = mean_psd[a_mask]
+            a_freqs = pf[a_mask]
+            a_psd = mp[a_mask]
             pk = np.argmax(a_psd)
-            ax_psd.plot(a_psd[pk], a_freqs[pk], "ro", ms=6, zorder=5)
-            ax_psd.annotate(
+            psd_ax.plot(a_psd[pk], a_freqs[pk], "ro", ms=6, zorder=5)
+            psd_ax.annotate(
                 f"{a_freqs[pk]:.1f} Hz",
                 xy=(a_psd[pk], a_freqs[pk]),
                 xytext=(8, 0), textcoords="offset points",
-                fontsize=7, color="red", fontweight="bold",
-                va="center",
+                fontsize=7, color="red", fontweight="bold", va="center",
             )
-        ax_psd.axhspan(8, 12, alpha=0.15, color="red")
-        return ax_psd
-
-    for i in range(n_panels):
-        bottom = bottom_start + (n_panels - 1 - i) * panel_gap
-        is_last = (i == n_panels - 1)
-
-        ax = fig.add_axes([0.08, bottom, spec_width, panel_height])
-
-        if i < n_channels:
-            # Regular channel
-            t, f, pdb = specs[i]
-            mesh = ax.pcolormesh(t, f, pdb, shading="gouraud", cmap="viridis",
-                                 vmin=vmin, vmax=vmax)
-            psd_freqs, mean_psd = compute_mean_psd(
-                data[i], fs, f_min, f_max, bw=0.5, step=0.1,
-            )
-        else:
-            # Composite best-channel panel
-            f = specs[0][1]
-            t = specs[0][0]
-            mesh = ax.pcolormesh(t, f, composite_dB, shading="gouraud",
-                                 cmap="viridis", vmin=vmin, vmax=vmax)
-            psd_freqs, mean_psd = compute_mean_psd_from_spectrogram(
-                f, composite_dB, f_min, f_max, bw=0.5, step=0.1,
-            )
-
-        ax.set_ylabel(f"{panel_labels[i]}\nFreq (Hz)", fontsize=9)
-        if not is_last:
-            ax.set_xticklabels([])
-        else:
-            ax.set_xlabel("Time (s)")
-        axes.append(ax)
-        meshes.append(mesh)
-
-        ax_psd = _add_psd_panel(ax, bottom, psd_freqs, mean_psd, is_last)
-        psd_axes.append(ax_psd)
-
-    # Colour bar
-    cbar_left = psd_left + psd_width + 0.015
-    cbar_ax = fig.add_axes([cbar_left, bottom_start, 0.012,
-                            panel_gap * n_panels - 0.02])
-    fig.colorbar(meshes[0], cax=cbar_ax, label="Power (dB)")
+        psd_ax.axhspan(8, 12, alpha=0.15, color="red")
 
     # --- Sliders ---
     ax_pos = fig.add_axes([0.15, 0.12, 0.7, 0.03])
@@ -377,27 +350,74 @@ def plot_spectrogram(recording, f_min=0, f_max=30):
 
         x_min = pos
         x_max = pos + window
-        for ax in axes:
-            ax.set_xlim(x_min, x_max)
+
+        idx = current_panel[0]
+        if idx < n_channels:
+            t_src, f_src, p_src = specs[idx]
+        else:
+            t_src, f_src, p_src = specs[0][0], specs[0][1], composite_dB
+
+        # ------- DYNAMIC FIDELITY: comment out this block for full resolution,
+        #         and uncomment the two lines after "END DYNAMIC FIDELITY". ------
+        margin = (x_max - x_min) * 0.02
+        vis_mask = (t_src >= x_min - margin) & (t_src <= x_max + margin)
+        vis_idx = np.where(vis_mask)[0]
+        if len(vis_idx) == 0:
+            return
+        max_cols = 800
+        if len(vis_idx) > max_cols:
+            ds_step = max(1, len(vis_idx) // max_cols)
+            vis_idx = vis_idx[::ds_step]
+        t_render = t_src[vis_idx]
+        p_render = p_src[:, vis_idx]
+        # ------- END DYNAMIC FIDELITY (uncomment below for full resolution) -----
+        # t_render = t_src
+        # p_render = p_src
+
+        mesh[0].remove()
+        mesh[0] = spec_ax.pcolormesh(t_render, f_src, p_render,
+                                      shading="gouraud", cmap="viridis",
+                                      vmin=vmin, vmax=vmax)
+        spec_ax.set_xlim(x_min, x_max)
+        spec_ax.set_ylabel("Freq (Hz)", fontsize=9)
+        spec_ax.set_xlabel("Time (s)")
+
         fig.canvas.draw_idle()
 
-    slider_pos.on_changed(update)
-    slider_zoom.on_changed(update)
+    def switch_panel(new_idx):
+        current_panel[0] = new_idx % n_panels
+        title_text.set_text(
+            f"Spectrogram: {recording.get('recording_name', '')} "
+            + u"\u2014 " + f"{panel_labels[current_panel[0]]}")
+        draw_psd(current_panel[0])
+        update()
+
+    def on_key(event):
+        if event.key == "right":
+            switch_panel(current_panel[0] + 1)
+        elif event.key == "left":
+            switch_panel(current_panel[0] - 1)
 
     def on_scroll(event):
-        if event.inaxes in axes or event.inaxes in psd_axes:
+        if event.inaxes in (spec_ax, psd_ax):
             cur = slider_zoom.val
             if event.button == "up":
                 slider_zoom.set_val(max(1.0, cur * 0.8))
             else:
                 slider_zoom.set_val(min(total_duration, cur * 1.25))
 
+    fig.canvas.mpl_connect("key_press_event", on_key)
     fig.canvas.mpl_connect("scroll_event", on_scroll)
+    slider_pos.on_changed(update)
+    slider_zoom.on_changed(update)
+
+    draw_psd(0)
     update()
 
     fig.text(
         0.5, 0.01,
-        "Scroll wheel to zoom | Drag sliders to navigate",
+        u"Left/Right: switch channel \u2502 Scroll: zoom \u2502 "
+        u"Sliders: navigate",
         ha="center", fontsize=9, style="italic", color="gray",
     )
 

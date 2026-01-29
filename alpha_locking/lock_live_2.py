@@ -54,28 +54,40 @@ DIAGNOSTIC_FUTURE_S = 0.400  # extra data to capture after fit
 # ---------------------------------------------------------------------------
 
 def fit_sinusoid(signal_section, fs, freq_lo, freq_hi, freq_step):
-    """Fit A*sin(2*pi*f*t + phi), grid-searching frequency for best RMSE."""
+    """Fit A*sin(2*pi*f*t + phi), grid-searching frequency for best RMSE.
+
+    Fully vectorized across all candidate frequencies — no Python loop.
+    """
     n = len(signal_section)
     t = np.arange(n) / fs
+    freqs = np.arange(freq_lo, freq_hi + freq_step / 2, freq_step)
 
-    best_rmse = np.inf
-    best_f = (freq_lo + freq_hi) / 2
+    # (n_freqs, n_samples)
+    wt = np.outer(2 * np.pi * freqs, t)
+    S = np.sin(wt)
+    C = np.cos(wt)
 
-    for f in np.arange(freq_lo, freq_hi + freq_step / 2, freq_step):
-        w = 2 * np.pi * f
-        X = np.column_stack([np.sin(w * t), np.cos(w * t)])
-        coeffs, _, _, _ = np.linalg.lstsq(X, signal_section, rcond=None)
-        resid = signal_section - X @ coeffs
-        rmse = np.sqrt(np.mean(resid ** 2))
-        if rmse < best_rmse:
-            best_rmse = rmse
-            best_f = f
-            best_coeffs = coeffs
+    # Normal equations for [a, b] in y = a*sin + b*cos
+    ss = np.sum(S * S, axis=1)
+    cc = np.sum(C * C, axis=1)
+    sc = np.sum(S * C, axis=1)
+    sy = S @ signal_section
+    cy = C @ signal_section
 
-    a, b = best_coeffs
-    amplitude = np.sqrt(a ** 2 + b ** 2)
-    phase = np.arctan2(b, a)
-    return best_f, amplitude, phase, best_rmse
+    det = ss * cc - sc * sc
+    a = (cc * sy - sc * cy) / det
+    b = (ss * cy - sc * sy) / det
+
+    # RMSE via analytic expansion (avoids building residual matrix)
+    yy = np.dot(signal_section, signal_section) / n
+    mse = yy - 2 * (a * sy + b * cy) / n + (a * a * ss + 2 * a * b * sc + b * b * cc) / n
+    rmse = np.sqrt(np.maximum(mse, 0.0))
+
+    best_idx = np.argmin(rmse)
+    best_f = freqs[best_idx]
+    amplitude = np.sqrt(a[best_idx] ** 2 + b[best_idx] ** 2)
+    phase = np.arctan2(b[best_idx], a[best_idx])
+    return best_f, amplitude, phase, float(rmse[best_idx])
 
 
 def synth_sinusoid(t, freq, amplitude, phase):
@@ -164,13 +176,15 @@ def main():
         # --- Pull all available samples ---
         chunk, timestamps = inlet.pull_chunk(timeout=0.01, max_samples=256)
         if chunk:
-            for sample in chunk:
-                for ch in range(n_eeg):
-                    x = np.array([sample[ch]])
-                    y, filter_states[ch] = sosfilt(sos, x, zi=filter_states[ch])
-                    raw_bufs[ch].append(sample[ch])
-                    filt_bufs[ch].append(y[0])
-                sample_count += 1
+            chunk_arr = np.array(chunk)  # (n_samples, n_channels)
+            for ch in range(n_eeg):
+                ch_data = chunk_arr[:, ch]
+                filtered, filter_states[ch] = sosfilt(
+                    sos, ch_data, zi=filter_states[ch],
+                )
+                raw_bufs[ch].extend(ch_data)
+                filt_bufs[ch].extend(filtered)
+            sample_count += len(chunk)
 
         # --- Check if time to fit ---
         now_wall = time.time()
@@ -219,11 +233,12 @@ def main():
         # Clean up expired timers
         pending_timers[:] = [t for t in pending_timers if t.is_alive()]
 
-        # --- Console output ---
-        trough_delays = [f"{(t - t_now)*1000:.0f}ms" for t in troughs[:4]]
-        print(f"fit: {freq:.2f}Hz  amp={amp:.2f}  rmse={rmse:.3f}  "
-              f"troughs=[{', '.join(trough_delays)}]  "
-              f"beeps at [{', '.join(trough_delays[1:4])}]")
+        # --- Console output (every 5th fit to avoid WSL2 print overhead) ---
+        if fit_round % 5 == 0:
+            trough_delays = [f"{(t - t_now)*1000:.0f}ms" for t in troughs[:4]]
+            print(f"fit: {freq:.2f}Hz  amp={amp:.2f}  rmse={rmse:.3f}  "
+                  f"troughs=[{', '.join(trough_delays)}]  "
+                  f"beeps at [{', '.join(trough_delays[1:4])}]")
 
         # --- Diagnostic capture for rounds 8-10 ---
         fit_round += 1
@@ -238,20 +253,19 @@ def main():
                 "fit_samples": fit_samples,
                 "lookback_samples": lookback_samples,
                 "wall_time": now_wall,
-                "sample_idx": sample_count,
+                "buf_end": len(filt_arr),
             })
 
             if fit_round == DIAG_START_ROUND + N_DIAGNOSTIC_ROUNDS - 1:
                 # Schedule the diagnostic plot after future data arrives
                 def capture_and_plot():
                     time.sleep(DIAGNOSTIC_FUTURE_S + 0.2)
-                    _save_diagnostic_plot(diagnostics, filt_bufs[best_ch],
-                                         fs, sample_count)
+                    _save_diagnostic_plot(diagnostics, filt_bufs[best_ch], fs)
                 t = threading.Thread(target=capture_and_plot, daemon=True)
                 t.start()
 
 
-def _save_diagnostic_plot(diagnostics, filt_buf, fs, current_sample_count):
+def _save_diagnostic_plot(diagnostics, filt_buf, fs):
     """Save diagnostic plot for captured fitting rounds."""
     import matplotlib
     matplotlib.use("Agg")
@@ -263,9 +277,6 @@ def _save_diagnostic_plot(diagnostics, filt_buf, fs, current_sample_count):
         axes = [axes]
 
     filt_arr = np.array(filt_buf)
-    # The deque's last element corresponds to current_sample_count.
-    # Position in array = sample_idx - (current_sample_count - len(filt_arr))
-    deque_offset = current_sample_count - len(filt_arr)
 
     for i, diag in enumerate(diagnostics):
         ax = axes[i]
@@ -279,11 +290,11 @@ def _save_diagnostic_plot(diagnostics, filt_buf, fs, current_sample_count):
         t_lookback = np.arange(len(lookback)) / fs
 
         # (b) Green: full 1400ms from the continuous filter buffer
-        end_abs = diag["sample_idx"] + future_samples
-        start_abs = diag["sample_idx"] - lookback_samples
-        # Convert absolute indices to deque positions
-        start_pos = max(0, start_abs - deque_offset)
-        end_pos = min(len(filt_arr), end_abs - deque_offset)
+        # buf_end is the deque length at capture time — avoids race with
+        # sample_count which is read from a different thread.
+        buf_end = diag["buf_end"]
+        start_pos = buf_end - lookback_samples
+        end_pos = min(buf_end + future_samples, len(filt_arr))
         full_window = filt_arr[start_pos:end_pos]
         t_full = np.arange(len(full_window)) / fs
 
