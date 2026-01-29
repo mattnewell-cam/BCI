@@ -91,17 +91,15 @@ def select_channel(data, fs):
     return best_ch, best_center, best_score
 
 
-def select_sections(data_1ch, fs, peak_freq, section_s=2.0, fraction=0.3):
-    """Select the top non-overlapping 2-second sections by in-band power.
+def select_sections(filtered, fs, section_s=2.0, fraction=0.3):
+    """Select the top non-overlapping 2-second sections by RMS of bandpassed signal.
 
     Parameters
     ----------
-    data_1ch : ndarray
-        Single-channel raw data.
+    filtered : ndarray
+        Already-bandpassed signal (from bandpass_filter).
     fs : float
         Sampling rate.
-    peak_freq : float
-        Centre of the 0.5 Hz peak band.
     section_s : float
         Section length in seconds.
     fraction : float
@@ -111,10 +109,10 @@ def select_sections(data_1ch, fs, peak_freq, section_s=2.0, fraction=0.3):
     -------
     sections : list of (start_sample, end_sample)
         Sorted by time.
-    powers : ndarray
-        In-band power for each section (same order as sections).
+    rms_values : ndarray
+        RMS for each selected section.
     """
-    n_samples = len(data_1ch)
+    n_samples = len(filtered)
     section_len = int(section_s * fs)
 
     # Build non-overlapping sections
@@ -127,36 +125,21 @@ def select_sections(data_1ch, fs, peak_freq, section_s=2.0, fraction=0.3):
     if not all_sections:
         return [], np.array([])
 
-    # Compute in-band power for each section (log before time-averaging)
-    band_lo = peak_freq - 0.25
-    band_hi = peak_freq + 0.25
-    section_powers = []
-    nperseg_sec = int(fs)  # 1s windows within 2s section -> 2 averages in log
-    noverlap_sec = int(0.5 * fs)
-    for s_start, s_end in all_sections:
-        chunk = data_1ch[s_start:s_end]
-        freqs, _, Sxx = scipy_spectrogram(
-            chunk, fs=fs, nperseg=nperseg_sec, noverlap=noverlap_sec,
-        )
-        log_power = 10 * np.log10(Sxx + 1e-20)
-        mean_db = log_power.mean(axis=1)  # log first, then average across time
-        band_mask = (freqs >= band_lo) & (freqs <= band_hi)
-        if np.any(band_mask):
-            section_powers.append(mean_db[band_mask].mean())
-        else:
-            section_powers.append(-200.0)
-
-    section_powers = np.array(section_powers)
+    # RMS of bandpassed signal per section — direct measure of in-band power
+    section_rms = np.array([
+        np.sqrt(np.mean(filtered[s:e] ** 2))
+        for s, e in all_sections
+    ])
 
     # Keep top fraction
     n_keep = max(1, int(len(all_sections) * fraction))
-    top_idx = np.argsort(section_powers)[::-1][:n_keep]
-    top_idx_sorted = np.sort(top_idx)  # re-sort by time
+    top_idx = np.argsort(section_rms)[::-1][:n_keep]
+    top_idx_sorted = np.sort(top_idx)
 
     sections = [all_sections[i] for i in top_idx_sorted]
-    powers = section_powers[top_idx_sorted]
+    rms_values = section_rms[top_idx_sorted]
 
-    return sections, powers
+    return sections, rms_values
 
 
 def bandpass_filter(data_1ch, fs, center_freq, bw=2.0, order=4):
@@ -237,9 +220,10 @@ def fit_sinusoid(signal_section, fs, freq, search_range=0.5, search_step=0.02):
 # Plotting
 # ---------------------------------------------------------------------------
 
-def plot_results(recording, best_ch, peak_freq, sections, filtered,
+def plot_results(recording, best_ch, peak_freq, sections,
+                 filtered_narrow, filtered_mid, filtered_wide,
                  fitted_sections, rmses):
-    """Three-panel figure: spectrogram, PSD profile, bandpassed signal."""
+    """Five-panel figure: spectrogram, PSD, and 3 bandpass widths."""
     from matplotlib.widgets import Slider
     from matplotlib.patches import Rectangle
 
@@ -267,13 +251,13 @@ def plot_results(recording, best_ch, peak_freq, sections, filtered,
     vmin = np.percentile(power_dB, 5)
     vmax = np.percentile(power_dB, 99)
 
-    # Rolling PSD for diagnostic panel — same function as channel selection
+    # Rolling PSD for diagnostic panel
     centers, rolling_db = rolling_alpha_profile(data[best_ch], fs)
 
-    overall_rmse = rmses[-1]  # last entry is overall
+    overall_rmse = rmses[-1]
 
-    # --- Figure ---
-    fig = plt.figure(figsize=(16, 11))
+    # --- Figure layout ---
+    fig = plt.figure(figsize=(16, 14))
     fig.suptitle(
         f"Alpha Sections: {recording.get('recording_name', '')}  |  "
         f"Ch: {labels[best_ch]}  |  Peak: {peak_freq:.1f} Hz  |  "
@@ -281,9 +265,14 @@ def plot_results(recording, best_ch, peak_freq, sections, filtered,
         fontsize=11, fontweight="bold",
     )
 
-    ax_spec = fig.add_axes([0.08, 0.58, 0.88, 0.32])
-    ax_psd = fig.add_axes([0.08, 0.42, 0.88, 0.13])
-    ax_sig = fig.add_axes([0.08, 0.20, 0.88, 0.18])
+    L = 0.08   # left
+    W = 0.88   # width
+    # top-to-bottom: spec, psd, sig_narrow, sig_mid, sig_wide, sliders
+    ax_spec = fig.add_axes([L, 0.74, W, 0.18])
+    ax_psd  = fig.add_axes([L, 0.62, W, 0.09])
+    ax_s1   = fig.add_axes([L, 0.46, W, 0.13])
+    ax_s2   = fig.add_axes([L, 0.30, W, 0.13])
+    ax_s3   = fig.add_axes([L, 0.14, W, 0.13])
 
     # -- Spectrogram --
     ax_spec.pcolormesh(spec_times, spec_freqs, power_dB, shading="gouraud",
@@ -292,10 +281,8 @@ def plot_results(recording, best_ch, peak_freq, sections, filtered,
     ax_spec.set_xticklabels([])
     ax_spec.set_title(f"Spectrogram — {labels[best_ch]}", fontsize=10)
 
-    # Highlight sections on spectrogram
     for idx, (s_start, s_end) in enumerate(sections):
-        t0 = s_start / fs
-        t1 = s_end / fs
+        t0, t1 = s_start / fs, s_end / fs
         rect = Rectangle(
             (t0, spec_freqs[0]), t1 - t0, spec_freqs[-1] - spec_freqs[0],
             linewidth=1.5, edgecolor="orange", facecolor="orange", alpha=0.15,
@@ -306,12 +293,10 @@ def plot_results(recording, best_ch, peak_freq, sections, filtered,
             ha="center", va="top", fontsize=7, color="orange",
             fontweight="bold",
         )
-
-    # Peak band lines
     ax_spec.axhline(peak_freq - 0.25, color="red", ls="--", lw=0.8, alpha=0.7)
     ax_spec.axhline(peak_freq + 0.25, color="red", ls="--", lw=0.8, alpha=0.7)
 
-    # -- PSD diagnostic panel --
+    # -- PSD diagnostic --
     ax_psd.plot(centers, rolling_db, color="white", lw=1.5)
     ax_psd.fill_between(centers, rolling_db.min() - 1, rolling_db,
                         alpha=0.3, color="cyan")
@@ -327,38 +312,46 @@ def plot_results(recording, best_ch, peak_freq, sections, filtered,
     )
     ax_psd.set_xlim(8, 12)
     ax_psd.set_ylabel("Mean dB")
-    ax_psd.set_xlabel("Frequency (Hz)")
+    ax_psd.set_xticklabels([])
     ax_psd.set_facecolor("#1a1a2e")
     ax_psd.set_title(
         "Rolling 0.5 Hz window power (0.1 Hz steps) — 8–12 Hz",
-        fontsize=10,
+        fontsize=9,
     )
-    ax_psd.legend(loc="upper right", fontsize=8)
+    ax_psd.legend(loc="upper right", fontsize=7)
 
-    # -- Bandpassed signal --
-    ax_sig.plot(t_full, filtered, color="#4488cc", lw=0.6, alpha=0.8,
-                label="Bandpassed")
+    # -- Signal panels --
+    filter_info = [
+        (ax_s1, filtered_narrow, f"\u00b11 Hz ({peak_freq-1:.1f}\u2013{peak_freq+1:.1f} Hz)"),
+        (ax_s2, filtered_mid,    f"\u00b12 Hz ({peak_freq-2:.1f}\u2013{peak_freq+2:.1f} Hz)"),
+        (ax_s3, filtered_wide,   "5\u201315 Hz"),
+    ]
 
-    for idx, (s_start, s_end) in enumerate(sections):
-        t_sec = np.arange(s_start, s_end) / fs
-        label = "Fitted sinusoid" if idx == 0 else None
-        ax_sig.plot(t_sec, fitted_sections[idx], color="orange", lw=1.2,
+    sig_axes = []
+    for i, (ax, sig, band_label) in enumerate(filter_info):
+        ax.plot(t_full, sig, color="#4488cc", lw=0.6, alpha=0.8)
+        # Overlay fitted sinusoids on all panels
+        for idx, (s_start, s_end) in enumerate(sections):
+            t_sec = np.arange(s_start, s_end) / fs
+            label = "Fitted sinusoid" if (idx == 0 and i == 0) else None
+            ax.plot(t_sec, fitted_sections[idx], color="orange", lw=1.2,
                     alpha=0.9, label=label)
+        ax.set_ylabel("Amp", fontsize=8)
+        ax.set_title(f"Bandpassed {band_label}", fontsize=9)
+        if i < len(filter_info) - 1:
+            ax.set_xticklabels([])
+        else:
+            ax.set_xlabel("Time (s)")
+        sig_axes.append(ax)
 
-    ax_sig.set_ylabel("Amplitude")
-    ax_sig.set_xlabel("Time (s)")
-    ax_sig.set_title(
-        f"Bandpassed {peak_freq - 1:.1f}–{peak_freq + 1:.1f} Hz "
-        f"(blue) + sinusoid fits (orange)",
-        fontsize=10,
-    )
-    ax_sig.legend(loc="upper right", fontsize=8)
+    if sig_axes:
+        sig_axes[0].legend(loc="upper right", fontsize=7)
 
-    axes = [ax_spec, ax_sig]
+    all_axes = [ax_spec] + sig_axes
 
     # -- Sliders --
-    ax_pos = fig.add_axes([0.15, 0.09, 0.7, 0.03])
-    ax_zoom = fig.add_axes([0.15, 0.03, 0.7, 0.03])
+    ax_pos = fig.add_axes([0.15, 0.07, 0.7, 0.02])
+    ax_zoom = fig.add_axes([0.15, 0.03, 0.7, 0.02])
 
     slider_pos = Slider(
         ax_pos, "Position (s)", 0, max(0.1, total_duration - default_window),
@@ -380,15 +373,16 @@ def plot_results(recording, best_ch, peak_freq, sections, filtered,
             pos = new_max
 
         x_min, x_max = pos, pos + window
-        for ax in axes:
+        for ax in all_axes:
             ax.set_xlim(x_min, x_max)
 
-        # Auto-scale signal axis
+        # Auto-scale each signal axis
         mask = (t_full >= x_min) & (t_full <= x_max)
         if np.any(mask):
-            vis = filtered[mask]
-            pad = 0.1 * (vis.max() - vis.min() + 1e-9)
-            ax_sig.set_ylim(vis.min() - pad, vis.max() + pad)
+            for ax, sig, _ in filter_info:
+                vis = sig[mask]
+                pad = 0.1 * (vis.max() - vis.min() + 1e-9)
+                ax.set_ylim(vis.min() - pad, vis.max() + pad)
 
         fig.canvas.draw_idle()
 
@@ -396,7 +390,7 @@ def plot_results(recording, best_ch, peak_freq, sections, filtered,
     slider_zoom.on_changed(update)
 
     def on_scroll(event):
-        if event.inaxes in axes:
+        if event.inaxes in all_axes:
             cur = slider_zoom.val
             if event.button == "up":
                 slider_zoom.set_val(max(1.0, cur * 0.8))
@@ -466,14 +460,16 @@ def main():
     print(f"  Concentration score: {score:.3f} "
           f"(fraction of 8-12 Hz power in best 0.5 Hz band)")
 
-    # 2. Select top sections
-    sections, powers = select_sections(data[best_ch], fs, peak_freq)
+    # 2. Bandpass filters (3 widths)
+    filtered_narrow = bandpass_filter(data[best_ch], fs, peak_freq, bw=2.0, order=4)
+    filtered_mid = bandpass_filter(data[best_ch], fs, peak_freq, bw=4.0, order=4)
+    filtered_wide = bandpass_filter(data[best_ch], fs, 10.0, bw=10.0, order=4)  # 5-15 Hz
+
+    # 3. Select top sections by RMS of narrow bandpassed signal
+    sections, rms_values = select_sections(filtered_narrow, fs)
     n_total = int(data.shape[1] / (2 * fs))
     print(f"\n  Sections: {len(sections)} of {n_total} "
           f"({len(sections)/max(1,n_total)*100:.0f}% of 2s chunks)")
-
-    # 3. Bandpass filter
-    filtered = bandpass_filter(data[best_ch], fs, peak_freq, bw=2.0, order=4)
 
     # 4. Fit sinusoids and compute RMSE
     print(f"\n  {'Section':>8}  {'Start':>7}  {'End':>7}  {'RMSE':>10}  "
@@ -485,7 +481,7 @@ def main():
     all_residuals = []
 
     for idx, (s_start, s_end) in enumerate(sections):
-        segment = filtered[s_start:s_end]
+        segment = filtered_narrow[s_start:s_end]
         fitted, rmse, amplitude, phase, fit_freq = fit_sinusoid(
             segment, fs, peak_freq,
         )
@@ -510,7 +506,8 @@ def main():
 
     # 5. Plot
     fig = plot_results(
-        recording, best_ch, peak_freq, sections, filtered,
+        recording, best_ch, peak_freq, sections,
+        filtered_narrow, filtered_mid, filtered_wide,
         fitted_sections, rmses,
     )
     plt.show()
