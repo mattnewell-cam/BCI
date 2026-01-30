@@ -22,6 +22,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 import sounddevice as sd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from scipy.signal import butter, sosfilt, argrelmin
 from pylsl import StreamInlet
 
@@ -52,6 +55,10 @@ BEEP_WAV = (BEEP_AMP * np.sin(2 * np.pi * BEEP_FREQ_HZ * _t)).astype(np.float32)
 _events = deque()
 _events_lock = threading.Lock()
 _stream_sample = 0
+
+# --- Diagnostic capture ---
+DIAG_ROUNDS = {6, 8, 10}
+DIAG_PATH = os.path.join(os.path.dirname(__file__), "..", "media", "lock_live_2_diagnostic.png")
 
 
 def schedule_beep(delay_s=0.0):
@@ -87,6 +94,74 @@ def _audio_callback(outdata, frames, time_info, status):
 
     outdata[:, 0] = out
     _stream_sample += frames
+
+
+def _save_diagnostic(snapshots):
+    """Save a 3-row diagnostic figure for captured rounds."""
+    rounds = sorted(snapshots.keys())
+    fig, axes = plt.subplots(len(rounds), 1, figsize=(12, 3 * len(rounds)),
+                             sharex=False)
+    if len(rounds) == 1:
+        axes = [axes]
+
+    for ax, rnd in zip(axes, rounds):
+        snap = snapshots[rnd]
+        fs = snap["fs"]
+        sig = snap["filtered"]
+        t_ms = np.arange(len(sig)) / fs * 1000  # time axis in ms
+
+        # Bandpassed signal
+        ax.plot(t_ms, sig, color="steelblue", linewidth=0.8, label="bandpassed")
+
+        # All detected troughs
+        all_tr = snap["trough_indices"]
+        ax.plot(t_ms[all_tr], sig[all_tr], "v", color="grey", markersize=5,
+                alpha=0.5, label="all troughs")
+
+        # Last 3 troughs (used for prediction)
+        last3 = snap["last3"]
+        ax.plot(t_ms[last3], sig[last3], "v", color="red", markersize=8,
+                zorder=5, label="last 3 troughs")
+
+        # Predicted future troughs
+        avg_gap = snap["avg_gap"]
+        last_t_sample = last3[2]
+        pred1_sample = last_t_sample + avg_gap
+        pred2_sample = last_t_sample + 2 * avg_gap
+        end_ms = t_ms[-1]
+
+        for i, ps in enumerate([pred1_sample, pred2_sample], 1):
+            ps_ms = ps / fs * 1000
+            if i == 1:
+                ax.axvline(ps_ms, color="orange", linestyle="--", linewidth=1.2,
+                           alpha=0.8, label="pred trough")
+            else:
+                ax.axvline(ps_ms, color="red", linestyle="--", linewidth=1.5,
+                           alpha=0.9, label="BEEP target")
+                ax.text(ps_ms + 3, sig.max() * 0.8, "BEEP", fontsize=8,
+                        color="red", fontweight="bold")
+
+        # Vertical line at window end
+        ax.axvline(end_ms, color="black", linestyle=":", linewidth=0.8,
+                   alpha=0.5, label="window end")
+
+        gap1 = snap["gap1"]
+        gap2 = snap["gap2"]
+        freq_est = fs / avg_gap
+        delay_ms = snap["next2_delay"] * 1000
+        ax.set_title(f"Round {rnd}:  freq={freq_est:.1f} Hz  "
+                     f"gaps={gap1},{gap2} (avg={avg_gap:.1f})  "
+                     f"delay={delay_ms:.0f}ms",
+                     fontsize=10, fontweight="bold")
+        ax.set_ylabel("uV (filtered)")
+        ax.legend(loc="upper left", fontsize=7, ncol=3)
+        ax.grid(True, alpha=0.3)
+
+    axes[-1].set_xlabel("Time (ms)")
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(DIAG_PATH), exist_ok=True)
+    fig.savefig(DIAG_PATH, dpi=150)
+    plt.close(fig)
 
 
 def main():
@@ -131,6 +206,9 @@ def main():
     audio_stream.start()
     schedule_beep(0.0)  # test beep
     print("Audio stream started (sounddevice)")
+
+    # Diagnostic snapshots for rounds 6, 8, 10
+    diag_snapshots = {}
 
     while True:
         # --- Pull all available samples ---
@@ -211,6 +289,24 @@ def main():
                   f"sched={t_sched*1000:.1f}ms  "
                   f"total={((t_filt+t_trough+t_sched)*1000):.1f}ms  "
                   f"interval={wall_interval:.0f}ms")
+
+        # --- Diagnostic snapshot ---
+        if fit_round in DIAG_ROUNDS:
+            diag_snapshots[fit_round] = {
+                "filtered": filtered.copy(),
+                "trough_indices": trough_indices.copy(),
+                "last3": last3.copy(),
+                "gap1": gap1,
+                "gap2": gap2,
+                "avg_gap": avg_gap,
+                "next2_delay": next2_delay,
+                "fs": fs,
+            }
+            print(f"  [diag] captured round {fit_round}")
+
+            if len(diag_snapshots) == len(DIAG_ROUNDS):
+                _save_diagnostic(diag_snapshots)
+                print(f"  [diag] saved {DIAG_PATH}")
 
 
 if __name__ == "__main__":
