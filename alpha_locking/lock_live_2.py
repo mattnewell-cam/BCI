@@ -20,18 +20,14 @@ from collections import deque
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
-import sounddevice as sd
 import datetime as dt
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.signal import butter, sosfilt, sosfilt_zi, argrelmin
-from pylsl import StreamInlet
-
-from utils import find_eeg_stream
 
 # --- Filter parameters ---
-BAND_LO = 7
+BAND_LO = 8
 BAND_HI = 12
 FILTER_ORDER = 4
 
@@ -49,6 +45,7 @@ FIT_INTERVAL_S = 0.100       # cursor stride during training
 LR_N_GAPS = 10               # min troughs needed in lookback (alpha-active gating)
 
 # --- Live loop ---
+DURATION_S = 20              # run for this many seconds then save diagnostics
 ASSUMED_LATENCY_S = 0.120    # assumed audio+processing latency to compensate
 MIN_DELAY_S = 0.005          # minimum delay to accept a prediction
 
@@ -70,6 +67,11 @@ _stream_sample = 0
 DIAG_ROUNDS = {6, 8, 10}
 DIAG_PATH = os.path.join(os.path.dirname(__file__), "..", "media",
                          "lock_live_2_diagnostic.png")
+BEEP_DIAG_ROUNDS = {20, 40, 60}
+BEEP_DIAG_PATH_LIVE = os.path.join(os.path.dirname(__file__), "..", "media",
+                                   "lock_live_2_beep_diag.png")
+BEEP_DIAG_PATH_TEST = os.path.join(os.path.dirname(__file__), "..", "media",
+                                   "test_lock_live_2_beep_diag.png")
 
 t0 = dt.datetime.now().timestamp()
 
@@ -125,6 +127,10 @@ def train_model(fs=256):
 
     rec = np.load(TRAIN_DATA, allow_pickle=True)
     data = rec["data"]
+    print("data.shape", data.shape, "dtype", data.dtype, "nbytes", data.nbytes / 1e6, "MB")
+    sig = data[CHANNEL_TP10]
+    print("sig.shape", sig.shape, "dtype", sig.dtype, "nbytes", sig.nbytes / 1e6, "MB")
+
     train_fs = int(rec["sample_rate"])
     assert train_fs == fs, f"Expected {fs} Hz training data, got {train_fs}"
 
@@ -223,6 +229,31 @@ def detect_trough(filt_arr, half_cycle, last_trough_abs, sample_count):
     return False, -1
 
 
+def detect_troughs_range(filt_arr, half_cycle, last_trough_abs, sample_count,
+                         first_candidate_idx, last_candidate_idx):
+    """Check a range of candidate positions for troughs.
+
+    Iterates from first_candidate_idx to last_candidate_idx (inclusive) in
+    filt_arr, yielding all confirmed troughs.
+
+    Yields (abs_sample_pos,) for each trough found.
+    """
+    n = len(filt_arr)
+    for candidate in range(first_candidate_idx, last_candidate_idx + 1):
+        if candidate < half_cycle or candidate + half_cycle >= n:
+            continue
+
+        lo = candidate - half_cycle
+        hi = candidate + half_cycle + 1
+        center_val = filt_arr[candidate]
+
+        if center_val <= filt_arr[lo:hi].min():
+            abs_pos = sample_count - (n - candidate)
+            if abs_pos - last_trough_abs >= half_cycle * 2:
+                last_trough_abs = abs_pos
+                yield abs_pos
+
+
 def _save_diagnostic(snapshots):
     """Save diagnostic figure showing input waveform, predicted waveform,
     predicted troughs, and beep target."""
@@ -285,7 +316,127 @@ def _save_diagnostic(snapshots):
     plt.close(fig)
 
 
+def save_beep_diag(captures, trough_spacings, beep_play_times, chunk_sizes,
+                   path, fs=256, half_cycle=10):
+    """Save beep diagnostic figure for comparing test vs live behavior.
+
+    captures: dict of {beep_number: snapshot_dict}
+    trough_spacings: list of inter-trough intervals in samples
+    beep_play_times: list of beep play times in seconds (simulated or real)
+    chunk_sizes: list of chunk sizes received
+    """
+    from matplotlib.gridspec import GridSpec
+
+    beep_nums = sorted(captures.keys())
+    n_beep_panels = len(beep_nums)
+    # beep panels + 1 row for two side-by-side histograms
+    fig = plt.figure(figsize=(14, 4 * (n_beep_panels + 1)))
+    gs = GridSpec(n_beep_panels + 1, 2, figure=fig,
+                  height_ratios=[1] * n_beep_panels + [1])
+
+    # --- Per-beep waveform panels (span both columns) ---
+    for i, bnum in enumerate(beep_nums):
+        ax = fig.add_subplot(gs[i, :])
+        snap = captures[bnum]
+
+        # Input signal (last 1s) -> time from -1000ms to 0
+        sig = snap["filt_signal"]
+        t_in = np.arange(len(sig)) / fs * 1000 - len(sig) / fs * 1000
+        ax.plot(t_in, sig, "steelblue", lw=0.8, label="input (1s)")
+
+        # Predicted waveform -> time from 0ms to 500ms
+        pred = snap["y_pred"]
+        t_pred = np.arange(len(pred)) / fs * 1000
+        ax.plot(t_pred, pred, "mediumpurple", lw=1.2, label="prediction (0.5s)")
+
+        # Predicted troughs
+        for j, ti in enumerate(snap["pred_troughs"]):
+            t_ms = ti / fs * 1000
+            if j == 0:
+                ax.axvline(t_ms, color="orange", ls="--", lw=1.0, alpha=0.7)
+            elif j == 1:
+                ax.axvline(t_ms, color="red", ls="--", lw=1.5,
+                           label=f"2nd trough @ {t_ms:.0f}ms")
+
+        # Beep target
+        delay_ms = snap["delay_s"] * 1000
+        if delay_ms > MIN_DELAY_S * 1000:
+            ax.axvline(delay_ms + ASSUMED_LATENCY_S * 1000, color="green",
+                       ls="-", lw=1.5, alpha=0.7,
+                       label=f"beep play @ {delay_ms + ASSUMED_LATENCY_S*1000:.0f}ms")
+
+        ax.axvline(0, color="black", ls=":", lw=0.8, alpha=0.5, label="now")
+
+        delta_target = snap["beep_target"] - snap["last_beep_target"]
+        title = (f"Beep #{bnum}  |  pred#{snap['prediction_count']}  "
+                 f"delay={delay_ms:.0f}ms  "
+                 f"target={snap['beep_target']}  "
+                 f"\u0394target={delta_target}  "
+                 f"chunk={snap['n_new']}  "
+                 f"trough_abs={snap['trough_abs']}  "
+                 f"SC={snap['sample_count']}")
+        ax.set_title(title, fontsize=9, fontweight="bold")
+        ax.legend(fontsize=7, loc="upper left", ncol=4)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylabel("uV (filtered)")
+
+    # --- Bottom row: two separate histograms ---
+    trough_spacings = np.array(trough_spacings) if trough_spacings else np.array([])
+    beep_play_times = np.array(beep_play_times) if beep_play_times else np.array([])
+    chunk_sizes = np.array(chunk_sizes) if chunk_sizes else np.array([])
+
+    # Left: trough spacing in ms
+    ax_ts = fig.add_subplot(gs[n_beep_panels, 0])
+    if len(trough_spacings) > 0:
+        trough_spacings_ms = trough_spacings / fs * 1000
+        bins_ts = np.arange(0, min(500, trough_spacings_ms.max() + 10), 5)
+        ax_ts.hist(trough_spacings_ms, bins=bins_ts, alpha=0.7, color="steelblue")
+        ax_ts.set_title(f"Trough-to-trough intervals (ms)\n"
+                        f"n={len(trough_spacings_ms)}  "
+                        f"mean={trough_spacings_ms.mean():.0f}ms  "
+                        f"min={trough_spacings_ms.min():.0f}ms",
+                        fontsize=9, fontweight="bold")
+    else:
+        ax_ts.set_title("Trough-to-trough intervals (no data)", fontsize=9)
+    ax_ts.set_xlabel("ms")
+    ax_ts.set_ylabel("count")
+    ax_ts.grid(True, alpha=0.3)
+
+    # Right: beep play-time intervals in ms
+    ax_bi = fig.add_subplot(gs[n_beep_panels, 1])
+    if len(beep_play_times) > 1:
+        intervals_ms = np.diff(beep_play_times) * 1000
+        bins_bi = np.arange(0, min(500, intervals_ms.max() + 10), 5)
+        ax_bi.hist(intervals_ms, bins=bins_bi, alpha=0.7, color="mediumpurple")
+        ax_bi.set_title(f"Beep play-time intervals (ms)\n"
+                        f"n={len(intervals_ms)}  "
+                        f"mean={intervals_ms.mean():.0f}ms  "
+                        f"min={intervals_ms.min():.0f}ms",
+                        fontsize=9, fontweight="bold")
+    else:
+        ax_bi.set_title("Beep play-time intervals (no data)", fontsize=9)
+    ax_bi.set_xlabel("ms")
+    ax_bi.set_ylabel("count")
+    ax_bi.grid(True, alpha=0.3)
+
+    cs_str = (f"chunks: n={len(chunk_sizes)} mean={chunk_sizes.mean():.1f} "
+              f"max={chunk_sizes.max()}" if len(chunk_sizes) > 0 else "")
+    fig.suptitle(f"half_cycle={half_cycle}  cooldown={half_cycle*2} samples "
+                 f"({half_cycle*2/fs*1000:.0f}ms)  |  {cs_str}",
+                 fontsize=10, fontweight="bold", y=1.0)
+
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  [beep_diag] saved {path}")
+
+
 def main():
+    import sounddevice as sd
+    from pylsl import StreamInlet
+    from utils import find_eeg_stream
+
     # ========== PHASE A: TRAIN MODEL ==========
     print("Training OLS model from recording data...")
     t0 = time.perf_counter()
@@ -317,34 +468,57 @@ def main():
     # Streaming bandpass filter state
     zi = sosfilt_zi(sos) * 0.0
 
-    # Ring buffers
-    filt_buf = deque(maxlen=int(2.0 * fs))  # 2s of filtered signal
+    # Ring buffer: pre-allocated numpy array + write pointer
+    _ring_cap = int(2.0 * fs)  # 2s of filtered signal
+    _ring = np.zeros(_ring_cap, dtype=np.float64)
+    _ring_n = 0  # how many valid samples are in the buffer
 
     # Open persistent low-latency audio stream
-    audio_stream = sd.OutputStream(
-        samplerate=AUDIO_FS, channels=1, callback=_audio_callback,
-        dtype="float32", latency="low",
-    )
-    audio_stream.start()
-    schedule_beep(0.0)  # test beep
-    print("Audio stream started")
+    audio_stream = None
+    try:
+        audio_stream = sd.OutputStream(
+            samplerate=AUDIO_FS, channels=1, callback=_audio_callback,
+            dtype="float32", latency="low",
+        )
+        audio_stream.start()
+        schedule_beep(0.0)  # test beep
+        print("Audio stream started")
+    except Exception as e:
+        print(f"Audio unavailable ({e}), running without sound")
 
     # Trough detection state
     last_trough_abs = -1000
     sample_count = 0
     prediction_count = 0
+    last_checked_candidate = -1  # absolute sample index of last checked candidate
+    last_beep_target_sample = -1000  # predicted beep time in absolute samples
+    last_beep_play_time = -1000.0   # wall-clock play time of last scheduled beep
+
+    # Beep cooldown: minimum samples between predicted beep times
+    beep_cooldown_samples = half_cycle * 2
+    beep_cooldown_s = beep_cooldown_samples / fs  # same cooldown in seconds
 
     # Diagnostic state
     diag_snapshots = {}
 
+    # Beep diagnostic tracking
+    beep_count = 0
+    beep_diag_captures = {}
+    trough_spacings = []
+    beep_times_wall = []
+    chunk_sizes = []
+    prev_trough_abs = -1000
+    t0_loop = time.perf_counter()
+
     print(f"Model: {BAND_LO}-{BAND_HI} Hz, "
           f"input={WAVEFORM_S}s@{fs // WAVEFORM_SUBSAMPLE}Hz, "
           f"output={WAVEFORM_OUT_NATIVE / fs:.2f}s@{fs}Hz, "
-          f"latency comp={ASSUMED_LATENCY_S * 1000:.0f}ms")
+          f"latency comp={ASSUMED_LATENCY_S * 1000:.0f}ms, "
+          f"half_cycle={half_cycle}")
     print(f"Buffering {WAVEFORM_S}s before predictions...")
 
     # ========== PHASE C: MAIN LOOP ==========
-    while True:
+    while time.perf_counter() - t0_loop < DURATION_S:
         # --- Pull all available EEG samples ---
         chunk, timestamps = inlet.pull_chunk(timeout=0.0, max_samples=256)
         if not chunk:
@@ -353,80 +527,188 @@ def main():
 
         chunk_arr = np.array(chunk)
         new_raw = chunk_arr[:, best_ch].astype(np.float64)
+        n_new = len(new_raw)
+        chunk_sizes.append(n_new)
 
         # --- Streaming bandpass filter ---
         new_filtered, zi = sosfilt(sos, new_raw, zi=zi)
 
         # --- Append to ring buffer ---
-        filt_buf.extend(new_filtered)
-        sample_count += len(new_raw)
+        if n_new >= _ring_cap:
+            # Chunk larger than buffer: keep only the last _ring_cap samples
+            _ring[:] = new_filtered[-_ring_cap:]
+            _ring_n = _ring_cap
+        elif _ring_n + n_new <= _ring_cap:
+            # Fits without wrapping
+            _ring[_ring_n:_ring_n + n_new] = new_filtered
+            _ring_n += n_new
+        else:
+            # Shift out oldest samples to make room
+            keep = _ring_cap - n_new
+            _ring[:keep] = _ring[_ring_n - keep:_ring_n]
+            _ring[keep:keep + n_new] = new_filtered
+            _ring_n = _ring_cap
+        sample_count += n_new
 
         # --- Need enough samples ---
-        if len(filt_buf) < waveform_native + half_cycle:
+        if _ring_n < waveform_native + half_cycle:
             continue
 
-        # --- Trough detection ---
-        filt_arr = np.array(filt_buf)
-        is_trough, trough_abs = detect_trough(
-            filt_arr, half_cycle, last_trough_abs, sample_count)
+        # --- Trough detection: check ALL new candidate positions ---
+        filt_arr = _ring[:_ring_n]
+        buf_len = _ring_n
 
-        if not is_trough:
+        # The rightmost confirmable candidate in the buffer
+        rightmost_candidate_idx = buf_len - 1 - half_cycle
+        rightmost_candidate_abs = sample_count - 1 - half_cycle
+
+        # The first new candidate to check: either the one after last_checked,
+        # or the leftmost valid candidate if we haven't checked any yet
+        if last_checked_candidate < 0:
+            first_candidate_abs = max(
+                sample_count - buf_len + half_cycle,
+                rightmost_candidate_abs - n_new + 1
+            )
+        else:
+            first_candidate_abs = last_checked_candidate + 1
+
+        # Clamp to valid range
+        first_candidate_abs = max(first_candidate_abs, rightmost_candidate_abs - n_new + 1)
+        first_candidate_abs = max(first_candidate_abs, sample_count - buf_len + half_cycle)
+
+        if first_candidate_abs > rightmost_candidate_abs:
+            last_checked_candidate = rightmost_candidate_abs
             continue
 
-        last_trough_abs = trough_abs
-        prediction_count += 1
+        # Convert absolute positions to buffer indices
+        first_candidate_idx = first_candidate_abs - (sample_count - buf_len)
+        last_candidate_idx = rightmost_candidate_idx
+        n_candidates = last_candidate_idx - first_candidate_idx + 1
 
-        # --- Prediction ---
-        t_pred_start = time.perf_counter()
+        for trough_abs in detect_troughs_range(
+                filt_arr, half_cycle, last_trough_abs, sample_count,
+                first_candidate_idx, last_candidate_idx):
 
-        # Extract last 1s of filtered signal, subsample to 64 points
-        input_wave = filt_arr[-waveform_native::WAVEFORM_SUBSAMPLE]  # (64,)
+            # Track trough spacing
+            spacing = trough_abs - last_trough_abs if last_trough_abs >= 0 else 0
+            if last_trough_abs >= 0:
+                trough_spacings.append(spacing)
+            if spacing < half_cycle * 2 and last_trough_abs >= 0:
+                print(f"  WARNING: trough spacing {spacing} < {half_cycle*2} "
+                      f"at abs={trough_abs} (last={last_trough_abs})")
 
-        # Normalize and predict
-        x = (input_wave - feat_mean) / feat_std
-        x = np.append(x, 1.0)  # bias -> (65,)
-        y_norm = x @ W          # (128,)
-        y_pred = y_norm * out_std + out_mean
+            last_trough_abs = trough_abs
+            prev_trough_abs = trough_abs
+            prediction_count += 1
 
-        # Find troughs in predicted waveform
-        pred_troughs = argrelmin(y_pred, order=half_cycle)[0]
+            # --- Prediction ---
+            t_pred_start = time.perf_counter()
 
-        if len(pred_troughs) < 2:
-            if prediction_count % 50 == 0:
-                print(f"[{prediction_count}] <2 troughs in prediction, skipping")
-            continue
+            # Extract last 1s of filtered signal, subsample to 64 points
+            input_wave = filt_arr[-waveform_native::WAVEFORM_SUBSAMPLE]  # (64,)
 
-        # 2nd trough offset in samples from "now" (end of input window)
-        trough_2_offset = pred_troughs[1]
-        delay_s = (trough_2_offset / fs) - ASSUMED_LATENCY_S
+            # Normalize and predict
+            x = (input_wave - feat_mean) / feat_std
+            x = np.append(x, 1.0)  # bias -> (65,)
+            y_norm = x @ W          # (128,)
+            y_pred = y_norm * out_std + out_mean
 
-        if delay_s > MIN_DELAY_S:
-            schedule_beep(delay_s)
+            # Find troughs in predicted waveform.
+            # Prepend half_cycle of real signal so argrelmin can detect
+            # troughs at/near t=0 (the boundary between history and prediction).
+            overlap = filt_arr[-half_cycle:]
+            search_sig = np.concatenate([overlap, y_pred])
+            raw_troughs = argrelmin(search_sig, order=half_cycle)[0]
+            pred_troughs = raw_troughs - half_cycle  # shift to prediction-relative
+            pred_troughs = pred_troughs[pred_troughs > 0]  # >0: exclude trigger trough at boundary
 
-        t_pred_elapsed = time.perf_counter() - t_pred_start
+            if len(pred_troughs) < 2:
+                if prediction_count % 50 == 0:
+                    print(f"[{prediction_count}] <2 troughs in prediction, skipping")
+                continue
 
-        # --- Console output ---
-        if prediction_count % 20 == 0:
-            print(f"[{prediction_count}] "
-                  f"pred_troughs={pred_troughs[:3].tolist()}  "
-                  f"delay={delay_s * 1000:.0f}ms  "
-                  f"compute={t_pred_elapsed * 1000:.1f}ms")
+            # 2nd trough offset in samples from "now" (end of input window)
+            trough_2_offset = pred_troughs[1]
+            delay_s = (trough_2_offset / fs) - ASSUMED_LATENCY_S
 
-        # --- Diagnostic capture ---
-        if prediction_count in DIAG_ROUNDS:
-            beep_delay_ms = delay_s * 1000 if delay_s > MIN_DELAY_S else None
-            diag_snapshots[prediction_count] = {
-                "input_signal": filt_arr[-waveform_native:].copy(),
-                "predicted": y_pred.copy(),
-                "pred_troughs": pred_troughs.copy(),
-                "beep_delay_ms": beep_delay_ms,
-                "fs": fs,
-            }
-            print(f"  [diag] captured round {prediction_count}")
+            if delay_s > MIN_DELAY_S:
+                # Beep cooldown: check BOTH sample-domain and wall-clock play time
+                beep_target_sample = sample_count + int(delay_s * fs)
+                beep_play_time = time.perf_counter() + delay_s
+                sample_ok = beep_target_sample - last_beep_target_sample >= beep_cooldown_samples
+                playtime_ok = beep_play_time - last_beep_play_time >= beep_cooldown_s
+                if sample_ok and playtime_ok:
+                    schedule_beep(delay_s)
+                    beep_count += 1
+                    beep_times_wall.append(beep_play_time)
 
-            if len(diag_snapshots) == len(DIAG_ROUNDS):
-                _save_diagnostic(diag_snapshots)
-                print(f"  [diag] saved {DIAG_PATH}")
+                    # Capture beep diagnostic
+                    if beep_count in BEEP_DIAG_ROUNDS:
+                        beep_diag_captures[beep_count] = {
+                            "filt_signal": filt_arr[-waveform_native:].copy(),
+                            "y_pred": y_pred.copy(),
+                            "pred_troughs": pred_troughs.copy(),
+                            "trough_abs": trough_abs,
+                            "sample_count": sample_count,
+                            "delay_s": delay_s,
+                            "beep_target": beep_target_sample,
+                            "last_beep_target": last_beep_target_sample,
+                            "prediction_count": prediction_count,
+                            "n_new": n_new,
+                            "n_candidates": n_candidates,
+                            "fs": fs,
+                        }
+
+                    last_beep_target_sample = beep_target_sample
+                    last_beep_play_time = beep_play_time
+
+            t_pred_elapsed = time.perf_counter() - t_pred_start
+
+            # --- Console output ---
+            if prediction_count % 100 == 0:
+                elapsed = time.perf_counter() - t0_loop
+                trough_rate = prediction_count / elapsed if elapsed > 0 else 0
+                beep_rate = beep_count / elapsed if elapsed > 0 else 0
+                print(f"[{prediction_count}] "
+                      f"pred_troughs={pred_troughs[:3].tolist()}  "
+                      f"delay={delay_s * 1000:.0f}ms  "
+                      f"compute={t_pred_elapsed * 1000:.1f}ms  "
+                      f"troughs/s={trough_rate:.1f}  "
+                      f"beeps/s={beep_rate:.1f}  "
+                      f"chunk={n_new}  "
+                      f"SC={sample_count}")
+
+            # --- Diagnostic capture ---
+            if prediction_count in DIAG_ROUNDS:
+                beep_delay_ms = delay_s * 1000 if delay_s > MIN_DELAY_S else None
+                diag_snapshots[prediction_count] = {
+                    "input_signal": filt_arr[-waveform_native:].copy(),
+                    "predicted": y_pred.copy(),
+                    "pred_troughs": pred_troughs.copy(),
+                    "beep_delay_ms": beep_delay_ms,
+                    "fs": fs,
+                }
+
+        last_checked_candidate = rightmost_candidate_abs
+
+    # ========== PHASE D: SAVE DIAGNOSTICS ==========
+    elapsed = time.perf_counter() - t0_loop
+    print(f"\nLoop finished after {elapsed:.1f}s  "
+          f"({prediction_count} predictions, {beep_count} beeps)")
+
+    if diag_snapshots:
+        _save_diagnostic(diag_snapshots)
+        print(f"  [diag] saved {DIAG_PATH}")
+
+    if beep_diag_captures:
+        save_beep_diag(
+            beep_diag_captures, trough_spacings,
+            beep_times_wall, chunk_sizes,
+            BEEP_DIAG_PATH_LIVE, fs, half_cycle)
+
+    if audio_stream is not None:
+        audio_stream.stop()
+        audio_stream.close()
 
 
 if __name__ == "__main__":

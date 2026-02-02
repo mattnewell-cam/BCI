@@ -101,7 +101,7 @@ def wait_for_good_contact(inlet, fs, n_eeg, ch_labels):
             bars[i].set_height(smooth_quality)
             bars[i].set_color(get_quality_color(smooth_quality))
 
-            if smooth_quality < 0.6:
+            if smooth_quality < 0.5:
                 all_good = False
 
         # Track green duration

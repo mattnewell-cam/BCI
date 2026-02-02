@@ -3,7 +3,11 @@
     "allow": [
       "Bash(python:*)",
       "Bash(python3:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(conda info:*)",
+      "Bash(pip3 list:*)",
+      "Bash(dpkg:*)",
+      "Bash(sudo apt-get install:*)"
     ]
   }
 }

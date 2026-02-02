@@ -46,7 +46,7 @@ COMBOS = [
 
 # ---- Recording loading (matches alpha_lock_sample.py pattern) ----
 
-def list_recordings(recordings_dir="../recordings"):
+def list_recordings(recordings_dir="recordings"):
     """List available recordings."""
     path = Path(recordings_dir)
     if not path.exists():

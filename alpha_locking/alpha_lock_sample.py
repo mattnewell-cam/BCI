@@ -18,8 +18,10 @@ import matplotlib.pyplot as plt
 from alpha_lock_logic import AlphaLockProcessor, beep
 
 
-def list_recordings(recordings_dir="../recordings"):
+def list_recordings(recordings_dir=None):
     """List available recordings."""
+    if recordings_dir is None:
+        recordings_dir = Path(__file__).resolve().parent / ".." / "recordings"
     path = Path(recordings_dir)
     if not path.exists():
         print(f"No recordings directory found at: {recordings_dir}")
