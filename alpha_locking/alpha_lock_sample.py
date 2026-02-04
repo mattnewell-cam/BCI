@@ -8,14 +8,19 @@ Usage:
     python alpha_lock_sample.py  # lists available recordings
 """
 
-import sys
-import os
 from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
+import sys
+import os
 
-from alpha_lock_logic import AlphaLockProcessor, beep
+try:
+    from alpha_lock_logic import AlphaLockProcessor, beep
+except ImportError:
+    from path_setup import add_repo_root
+    add_repo_root()
+    from alpha_lock_logic import AlphaLockProcessor, beep
 
 
 def list_recordings(recordings_dir=None):
@@ -166,7 +171,7 @@ def plot_results(results, recording_name=""):
     # Plot 1: Filtered signal + NCO
     ax1 = axes[0]
     ax1.plot(t, results["xf"], label="xf (filtered)", alpha=0.8, lw=0.8)
-    nco_scaled = results["nco"] * np.std(results["xf"]) * 2
+    nco_scaled = -results["nco"] * np.std(results["xf"]) * 2
     ax1.plot(t, nco_scaled, label="NCO (scaled)", alpha=0.7, lw=0.8)
     beep_lines_1 = [ax1.axvline(bt, color="red", alpha=0.4, lw=1) for bt in results["beep_times"]]
     ax1.set_ylabel("Amplitude")

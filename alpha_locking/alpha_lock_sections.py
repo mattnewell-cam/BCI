@@ -19,7 +19,12 @@ import numpy as np
 from scipy.signal import butter, sosfilt, welch, spectrogram as scipy_spectrogram
 import matplotlib.pyplot as plt
 
-from alpha_lock_sample import load_recording, list_recordings
+try:
+    from alpha_lock_sample import load_recording, list_recordings
+except ImportError:
+    from path_setup import add_repo_root
+    add_repo_root()
+    from alpha_lock_sample import load_recording, list_recordings
 
 CHANNEL_LABELS = ["AF7", "AF8", "TP9", "TP10"]
 

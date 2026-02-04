@@ -46,7 +46,7 @@ LR_N_GAPS = 10               # min troughs needed in lookback (alpha-active gati
 
 # --- Live loop ---
 DURATION_S = 20              # run for this many seconds then save diagnostics
-ASSUMED_LATENCY_S = 0.120    # assumed audio+processing latency to compensate
+ASSUMED_LATENCY_S = 0.0    # assumed audio+processing latency to compensate
 MIN_DELAY_S = 0.005          # minimum delay to accept a prediction
 
 # --- Audio ---
@@ -509,6 +509,51 @@ def main():
     chunk_sizes = []
     prev_trough_abs = -1000
     t0_loop = time.perf_counter()
+    last_loop_t = t0_loop
+    last_loop_end = t0_loop
+    last_chunk_ts = None
+
+    # Timing diagnostics
+    timing_totals = {
+        "pull": 0.0,
+        "filter": 0.0,
+        "ring": 0.0,
+        "candidates": 0.0,
+        "trough_scan": 0.0,
+        "predict": 0.0,
+        "schedule": 0.0,
+        "loop": 0.0,
+    }
+    timing_max = {k: 0.0 for k in timing_totals}
+    timing_samples = 0
+    slow_loop_threshold_s = 0.200
+
+    # Accumulate time between beeps to explain >200ms gaps
+    since_beep = {
+        "idle": 0.0,
+        "pull": 0.0,
+        "sleep": 0.0,
+        "filter": 0.0,
+        "ring": 0.0,
+        "candidates": 0.0,
+        "trough_scan": 0.0,
+        "predict": 0.0,
+        "schedule": 0.0,
+        "other": 0.0,
+    }
+    last_beep_wall = None
+    beep_gap_threshold_s = 0.200
+    since_beep_counts = {
+        "chunks": 0,
+        "samples": 0,
+        "troughs": 0,
+        "predictions": 0,
+        "pred_lt2_troughs": 0,
+        "delay_too_short": 0,
+        "cooldown_sample_block": 0,
+        "cooldown_play_block": 0,
+        "scheduled": 0,
+    }
 
     print(f"Model: {BAND_LO}-{BAND_HI} Hz, "
           f"input={WAVEFORM_S}s@{fs // WAVEFORM_SUBSAMPLE}Hz, "
@@ -519,21 +564,80 @@ def main():
 
     # ========== PHASE C: MAIN LOOP ==========
     while time.perf_counter() - t0_loop < DURATION_S:
+        t_loop_start = time.perf_counter()
+        iter_times = {
+            "pull": 0.0,
+            "sleep": 0.0,
+            "filter": 0.0,
+            "ring": 0.0,
+            "candidates": 0.0,
+            "trough_scan": 0.0,
+            "predict": 0.0,
+            "schedule": 0.0,
+            "other": 0.0,
+        }
+        idle_gap = t_loop_start - last_loop_end
+        loop_gap = t_loop_start - last_loop_t
+        last_loop_t = t_loop_start
+        if idle_gap > 0:
+            since_beep["idle"] += idle_gap
+
         # --- Pull all available EEG samples ---
+        t_pull_start = time.perf_counter()
         chunk, timestamps = inlet.pull_chunk(timeout=0.0, max_samples=256)
+        t_pull = time.perf_counter() - t_pull_start
+        timing_totals["pull"] += t_pull
+        if t_pull > timing_max["pull"]:
+            timing_max["pull"] = t_pull
+        iter_times["pull"] += t_pull
         if not chunk:
+            t_sleep_start = time.perf_counter()
             time.sleep(0.001)
+            t_sleep = time.perf_counter() - t_sleep_start
+            iter_times["sleep"] += t_sleep
+
+            t_loop = time.perf_counter() - t_loop_start
+            iter_times["other"] = max(0.0, t_loop - sum(iter_times.values()))
+            for k, v in iter_times.items():
+                since_beep[k] += v
+            last_loop_end = time.perf_counter()
+            if t_loop > slow_loop_threshold_s:
+                accounted = sum(iter_times.values())
+                unaccounted = max(0.0, t_loop - accounted)
+                print(f"[slow-loop] total={t_loop*1000:.1f}ms gap={loop_gap*1000:.1f}ms")
+                for k in ["pull", "sleep", "other"]:
+                    v = iter_times[k]
+                    if v > 0:
+                        print(f"{k} action: {v*1000:.1f} ms")
+                if unaccounted > 0.0005:
+                    print(f"unaccounted action: {unaccounted*1000:.1f} ms")
             continue
 
         chunk_arr = np.array(chunk)
         new_raw = chunk_arr[:, best_ch].astype(np.float64)
         n_new = len(new_raw)
         chunk_sizes.append(n_new)
+        since_beep_counts["chunks"] += 1
+        since_beep_counts["samples"] += n_new
+        if timestamps:
+            chunk_start_ts = timestamps[0]
+            if last_chunk_ts is not None:
+                lsl_gap = chunk_start_ts - last_chunk_ts
+                if lsl_gap > 0.200:
+                    print(f"[lsl-gap] {lsl_gap*1000:.1f}ms (n_new={n_new})")
+            last_chunk_ts = timestamps[-1]
 
         # --- Streaming bandpass filter ---
+        t_filter_start = time.perf_counter()
         new_filtered, zi = sosfilt(sos, new_raw, zi=zi)
+        t_filter = time.perf_counter() - t_filter_start
+        timing_totals["filter"] += t_filter
+        if t_filter > timing_max["filter"]:
+            timing_max["filter"] = t_filter
+        iter_times["filter"] += t_filter
 
         # --- Append to ring buffer ---
+        t_ring_start = time.perf_counter()
         if n_new >= _ring_cap:
             # Chunk larger than buffer: keep only the last _ring_cap samples
             _ring[:] = new_filtered[-_ring_cap:]
@@ -549,12 +653,33 @@ def main():
             _ring[keep:keep + n_new] = new_filtered
             _ring_n = _ring_cap
         sample_count += n_new
+        t_ring = time.perf_counter() - t_ring_start
+        timing_totals["ring"] += t_ring
+        if t_ring > timing_max["ring"]:
+            timing_max["ring"] = t_ring
+        iter_times["ring"] += t_ring
 
         # --- Need enough samples ---
         if _ring_n < waveform_native + half_cycle:
+            t_loop = time.perf_counter() - t_loop_start
+            iter_times["other"] = max(0.0, t_loop - sum(iter_times.values()))
+            for k, v in iter_times.items():
+                since_beep[k] += v
+            last_loop_end = time.perf_counter()
+            if t_loop > slow_loop_threshold_s:
+                accounted = sum(iter_times.values())
+                unaccounted = max(0.0, t_loop - accounted)
+                print(f"[slow-loop] total={t_loop*1000:.1f}ms gap={loop_gap*1000:.1f}ms")
+                for k in ["pull", "sleep", "filter", "ring", "other"]:
+                    v = iter_times[k]
+                    if v > 0:
+                        print(f"{k} action: {v*1000:.1f} ms")
+                if unaccounted > 0.0005:
+                    print(f"unaccounted action: {unaccounted*1000:.1f} ms")
             continue
 
         # --- Trough detection: check ALL new candidate positions ---
+        t_candidates_start = time.perf_counter()
         filt_arr = _ring[:_ring_n]
         buf_len = _ring_n
 
@@ -584,7 +709,13 @@ def main():
         first_candidate_idx = first_candidate_abs - (sample_count - buf_len)
         last_candidate_idx = rightmost_candidate_idx
         n_candidates = last_candidate_idx - first_candidate_idx + 1
+        t_candidates = time.perf_counter() - t_candidates_start
+        timing_totals["candidates"] += t_candidates
+        if t_candidates > timing_max["candidates"]:
+            timing_max["candidates"] = t_candidates
+        iter_times["candidates"] += t_candidates
 
+        t_scan_start = time.perf_counter()
         for trough_abs in detect_troughs_range(
                 filt_arr, half_cycle, last_trough_abs, sample_count,
                 first_candidate_idx, last_candidate_idx):
@@ -600,6 +731,8 @@ def main():
             last_trough_abs = trough_abs
             prev_trough_abs = trough_abs
             prediction_count += 1
+            since_beep_counts["troughs"] += 1
+            since_beep_counts["predictions"] += 1
 
             # --- Prediction ---
             t_pred_start = time.perf_counter()
@@ -623,6 +756,7 @@ def main():
             pred_troughs = pred_troughs[pred_troughs > 0]  # >0: exclude trigger trough at boundary
 
             if len(pred_troughs) < 2:
+                since_beep_counts["pred_lt2_troughs"] += 1
                 if prediction_count % 50 == 0:
                     print(f"[{prediction_count}] <2 troughs in prediction, skipping")
                 continue
@@ -638,31 +772,81 @@ def main():
                 sample_ok = beep_target_sample - last_beep_target_sample >= beep_cooldown_samples
                 playtime_ok = beep_play_time - last_beep_play_time >= beep_cooldown_s
                 if sample_ok and playtime_ok:
+                    t_sched_start = time.perf_counter()
                     schedule_beep(delay_s)
+                    t_sched = time.perf_counter() - t_sched_start
+                    timing_totals["schedule"] += t_sched
+                    if t_sched > timing_max["schedule"]:
+                        timing_max["schedule"] = t_sched
+                    iter_times["schedule"] += t_sched
                     beep_count += 1
                     beep_times_wall.append(beep_play_time)
+                    since_beep_counts["scheduled"] += 1
 
-                    # Capture beep diagnostic
-                    if beep_count in BEEP_DIAG_ROUNDS:
-                        beep_diag_captures[beep_count] = {
-                            "filt_signal": filt_arr[-waveform_native:].copy(),
-                            "y_pred": y_pred.copy(),
-                            "pred_troughs": pred_troughs.copy(),
-                            "trough_abs": trough_abs,
-                            "sample_count": sample_count,
-                            "delay_s": delay_s,
-                            "beep_target": beep_target_sample,
-                            "last_beep_target": last_beep_target_sample,
-                            "prediction_count": prediction_count,
-                            "n_new": n_new,
-                            "n_candidates": n_candidates,
-                            "fs": fs,
-                        }
+                    now_wall = time.perf_counter()
+                    if last_beep_wall is not None:
+                        gap = now_wall - last_beep_wall
+                        if gap > beep_gap_threshold_s:
+                            accounted = sum(since_beep.values())
+                            unaccounted = max(0.0, gap - accounted)
+                            print(f"[beep-gap] total={gap*1000:.1f}ms")
+                            print("counts "
+                                  f"chunks={since_beep_counts['chunks']} "
+                                  f"samples={since_beep_counts['samples']} "
+                                  f"troughs={since_beep_counts['troughs']} "
+                                  f"pred={since_beep_counts['predictions']} "
+                                  f"lt2={since_beep_counts['pred_lt2_troughs']} "
+                                  f"delay_short={since_beep_counts['delay_too_short']} "
+                                  f"cd_sample={since_beep_counts['cooldown_sample_block']} "
+                                  f"cd_play={since_beep_counts['cooldown_play_block']} "
+                                  f"scheduled={since_beep_counts['scheduled']}")
+                            for k in ["idle", "pull", "sleep", "filter", "ring",
+                                      "candidates", "trough_scan", "predict",
+                                      "schedule", "other"]:
+                                v = since_beep[k]
+                                if v > 0:
+                                    print(f"{k} action: {v*1000:.1f} ms")
+                            if unaccounted > 0.0005:
+                                print(f"unaccounted action: {unaccounted*1000:.1f} ms")
+                    last_beep_wall = now_wall
+                    for k in since_beep:
+                        since_beep[k] = 0.0
+                    for k in since_beep_counts:
+                        since_beep_counts[k] = 0
+                else:
+                    if not sample_ok:
+                        since_beep_counts["cooldown_sample_block"] += 1
+                    if not playtime_ok:
+                        since_beep_counts["cooldown_play_block"] += 1
+            else:
+                since_beep_counts["delay_too_short"] += 1
 
-                    last_beep_target_sample = beep_target_sample
-                    last_beep_play_time = beep_play_time
+            # Capture beep diagnostic
+            if delay_s > MIN_DELAY_S and sample_ok and playtime_ok:
+                if beep_count in BEEP_DIAG_ROUNDS:
+                    beep_diag_captures[beep_count] = {
+                        "filt_signal": filt_arr[-waveform_native:].copy(),
+                        "y_pred": y_pred.copy(),
+                        "pred_troughs": pred_troughs.copy(),
+                        "trough_abs": trough_abs,
+                        "sample_count": sample_count,
+                        "delay_s": delay_s,
+                        "beep_target": beep_target_sample,
+                        "last_beep_target": last_beep_target_sample,
+                        "prediction_count": prediction_count,
+                        "n_new": n_new,
+                        "n_candidates": n_candidates,
+                        "fs": fs,
+                    }
+
+                last_beep_target_sample = beep_target_sample
+                last_beep_play_time = beep_play_time
 
             t_pred_elapsed = time.perf_counter() - t_pred_start
+            timing_totals["predict"] += t_pred_elapsed
+            if t_pred_elapsed > timing_max["predict"]:
+                timing_max["predict"] = t_pred_elapsed
+            iter_times["predict"] += t_pred_elapsed
 
             # --- Console output ---
             if prediction_count % 100 == 0:
@@ -690,6 +874,46 @@ def main():
                 }
 
         last_checked_candidate = rightmost_candidate_abs
+        t_scan = time.perf_counter() - t_scan_start
+        timing_totals["trough_scan"] += t_scan
+        if t_scan > timing_max["trough_scan"]:
+            timing_max["trough_scan"] = t_scan
+        iter_times["trough_scan"] += t_scan
+
+        t_loop = time.perf_counter() - t_loop_start
+        timing_totals["loop"] += t_loop
+        if t_loop > timing_max["loop"]:
+            timing_max["loop"] = t_loop
+        timing_samples += 1
+        iter_times["other"] = max(0.0, t_loop - sum(iter_times.values()))
+        for k, v in iter_times.items():
+            since_beep[k] += v
+        last_loop_end = time.perf_counter()
+
+        if t_loop > slow_loop_threshold_s:
+            accounted = sum(iter_times.values())
+            unaccounted = max(0.0, t_loop - accounted)
+            print(f"[slow-loop] total={t_loop*1000:.1f}ms gap={loop_gap*1000:.1f}ms")
+            for k in ["pull", "sleep", "filter", "ring", "candidates",
+                      "trough_scan", "predict", "schedule", "other"]:
+                v = iter_times[k]
+                if v > 0:
+                    print(f"{k} action: {v*1000:.1f} ms")
+            if unaccounted > 0.0005:
+                print(f"unaccounted action: {unaccounted*1000:.1f} ms")
+
+        if timing_samples % 200 == 0:
+            avg = {k: (timing_totals[k] / timing_samples) * 1000 for k in timing_totals}
+            mx = {k: timing_max[k] * 1000 for k in timing_max}
+            print("[timing] avg_ms "
+                  f"pull={avg['pull']:.2f} filter={avg['filter']:.2f} ring={avg['ring']:.2f} "
+                  f"candidates={avg['candidates']:.2f} scan={avg['trough_scan']:.2f} "
+                  f"predict={avg['predict']:.2f} schedule={avg['schedule']:.2f} "
+                  f"loop={avg['loop']:.2f} | "
+                  f"max_ms pull={mx['pull']:.2f} filter={mx['filter']:.2f} ring={mx['ring']:.2f} "
+                  f"candidates={mx['candidates']:.2f} scan={mx['trough_scan']:.2f} "
+                  f"predict={mx['predict']:.2f} schedule={mx['schedule']:.2f} "
+                  f"loop={mx['loop']:.2f}")
 
     # ========== PHASE D: SAVE DIAGNOSTICS ==========
     elapsed = time.perf_counter() - t0_loop

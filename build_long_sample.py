@@ -3,11 +3,12 @@ Long EEG recording tool.
 
 - Waits for good contact on all channels
 - Records indefinitely in 5-minute chunks
-- Appends to recordings/full_night.npz after each chunk
-- Exits cleanly if the Muse disconnects
+- Appends to recordings/full_night_2.npz after each chunk
+- Auto-reconnects BlueMuse if the Muse disconnects
 """
 
 import os
+import subprocess
 import time
 import tempfile
 from datetime import datetime
@@ -21,8 +22,14 @@ from create_sample import wait_for_good_contact
 
 SAVE_INTERVAL_S = 20.0  # 5 minutes
 DISCONNECT_TIMEOUT_S = 10.0
+RECONNECT_PAUSE_S = 5.0
+RECONNECT_STREAM_TIMEOUT_S = 120.0
+MAX_RECONNECT_ATTEMPTS = 50
 OUTPUT_DIR = "recordings"
-OUTPUT_NAME = "full_night.npz"
+OUTPUT_NAME = "night_2.npz"
+
+# Set this to your Muse's Bluetooth MAC address (format: XX:XX:XX:XX:XX:XX)
+MUSE_MAC_ADDRESS = "00:55:da:b5:f6:a4"
 
 
 def _append_and_save(out_path, data_chunk, ts_chunk, fs, ch_labels, start_iso):
@@ -59,11 +66,59 @@ def _append_and_save(out_path, data_chunk, ts_chunk, fs, ch_labels, start_iso):
         timestamps=ts_all,
         sample_rate=fs,
         channel_labels=ch_labels,
-        recording_name="full_night",
+        recording_name="full_night_2",
         recording_date=start_iso,
         duration_seconds=data_all.shape[1] / fs if data_all.shape[1] > 0 else 0,
     )
     os.replace(tmp_path, out_path)
+
+
+def _restart_bluemuse():
+    """Restart BlueMuse streaming via its URI protocol."""
+    if MUSE_MAC_ADDRESS:
+        uri = f"bluemuse://start?addresses={MUSE_MAC_ADDRESS}"
+    else:
+        uri = "bluemuse:"
+    print(f"  Launching BlueMuse: {uri}")
+    try:
+        subprocess.run(
+            ["cmd.exe", "/c", "start", "", uri],
+            timeout=10,
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        # Fallback for non-WSL Windows
+        subprocess.run(
+            ["start", "", uri],
+            shell=True,
+            timeout=10,
+            capture_output=True,
+        )
+
+
+def _reconnect():
+    """Restart BlueMuse and wait for a new LSL EEG stream. Returns a new StreamInlet."""
+    for attempt in range(1, MAX_RECONNECT_ATTEMPTS + 1):
+        print(f"\nReconnect attempt {attempt}/{MAX_RECONNECT_ATTEMPTS}...")
+        _restart_bluemuse()
+        print(f"  Waiting up to {RECONNECT_STREAM_TIMEOUT_S:.0f}s for LSL stream...")
+
+        deadline = time.time() + RECONNECT_STREAM_TIMEOUT_S
+        while time.time() < deadline:
+            try:
+                s = find_eeg_stream()
+                inlet = StreamInlet(s, max_buflen=2)
+                # Drain any stale buffered data
+                inlet.pull_chunk(timeout=0.0, max_samples=4096)
+                info = inlet.info()
+                print(f"  Reconnected: {info.name()}")
+                return inlet, info
+            except RuntimeError:
+                time.sleep(RECONNECT_PAUSE_S)
+
+        print(f"  Attempt {attempt} failed, no stream found.")
+
+    raise RuntimeError(f"Could not reconnect after {MAX_RECONNECT_ATTEMPTS} attempts.")
 
 
 def _record_interval(inlet, fs, n_eeg, duration_s):
@@ -101,12 +156,9 @@ def main():
     print("Long EEG Recording Tool")
     print("=" * 50)
 
-    # Connect to EEG stream
-    print("\nSearching for EEG stream...")
-    s = find_eeg_stream()
-    inlet = StreamInlet(s, max_buflen=2)
-
-    info = inlet.info()
+    # Connect to EEG stream via BlueMuse
+    print("\nStarting BlueMuse and waiting for EEG stream...")
+    inlet, info = _reconnect()
     fs = float(info.nominal_srate())
     n_channels = int(info.channel_count())
     ch_labels = get_channel_labels(info, n_channels)
@@ -125,27 +177,44 @@ def main():
     out_path = os.path.join(OUTPUT_DIR, OUTPUT_NAME)
     start_iso = datetime.now().isoformat()
     chunk_idx = 0
+    reconnect_count = 0
 
     print("\nStarting long recording. Saving every 5 minutes...")
+    print("Auto-reconnect is enabled.\n")
 
     try:
         while True:
-            chunk_idx += 1
-            print(f"\nChunk {chunk_idx}: recording {SAVE_INTERVAL_S:.0f}s...")
-            data_chunk, ts_chunk = _record_interval(inlet, fs, n_eeg, SAVE_INTERVAL_S)
-            _append_and_save(out_path, data_chunk, ts_chunk, fs, ch_labels, start_iso)
-            print(f"Saved chunk {chunk_idx} -> {out_path}")
-    except Exception as exc:
-        print(f"\nStopping: {exc}")
-        # Best-effort save on exit if we have partial data
-        try:
-            if "data_chunk" in locals() and data_chunk.shape[1] > 0:
+            try:
+                chunk_idx += 1
+                print(f"\nChunk {chunk_idx}: recording {SAVE_INTERVAL_S:.0f}s...")
+                data_chunk, ts_chunk = _record_interval(inlet, fs, n_eeg, SAVE_INTERVAL_S)
                 _append_and_save(out_path, data_chunk, ts_chunk, fs, ch_labels, start_iso)
-                print(f"Saved final partial chunk -> {out_path}")
-        except Exception as save_exc:
-            print(f"Failed to save final chunk: {save_exc}")
+                print(f"Saved chunk {chunk_idx} -> {out_path}")
+            except RuntimeError as exc:
+                print(f"\nDisconnect detected: {exc}")
 
-    print("\nDone.")
+                # Save any partial data from the failed chunk
+                try:
+                    if "data_chunk" in locals() and data_chunk.shape[1] > 0:
+                        _append_and_save(out_path, data_chunk, ts_chunk, fs, ch_labels, start_iso)
+                        print(f"Saved partial chunk -> {out_path}")
+                except Exception:
+                    pass
+
+                # Reconnect
+                inlet, info = _reconnect()
+                fs = float(info.nominal_srate())
+                n_channels = int(info.channel_count())
+                n_eeg = min(4, n_channels)
+                reconnect_count += 1
+                print(f"Resumed recording (reconnect #{reconnect_count})")
+
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+    except Exception as exc:
+        print(f"\nFatal error: {exc}")
+
+    print(f"\nDone. Total reconnects: {reconnect_count}")
 
 
 if __name__ == "__main__":

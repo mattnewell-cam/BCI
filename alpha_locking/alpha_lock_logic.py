@@ -8,7 +8,12 @@ live streaming and offline sample processing.
 import math
 import numpy as np
 from scipy.signal import butter, lfilter, lfilter_zi, iirnotch, welch
-from utils import butter_bandpass, bandpower_welch
+try:
+    from utils import butter_bandpass, bandpower_welch
+except ImportError:
+    from path_setup import add_repo_root
+    add_repo_root()
+    from utils import butter_bandpass, bandpower_welch
 
 
 class AlphaPLL:

@@ -2,7 +2,7 @@
 LSL replay script for interactive testing of lock_live_2.
 
 Loads npz recording data and pushes it over LSL as a fake Muse EEG stream
-at real-time speed (256 Hz, chunks of ~8 samples every ~31ms).
+at real-time speed (256 Hz, chunks of 8 samples every 32ms).
 
 Usage:
     Terminal 1:  python alpha_locking/replay_lsl.py

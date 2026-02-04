@@ -4,7 +4,12 @@ from collections import deque
 import numpy as np
 from pylsl import StreamInlet
 from scipy.signal import lfilter
-from utils import find_eeg_stream, butter_bandpass, bandpower_welch
+try:
+    from utils import find_eeg_stream, butter_bandpass, bandpower_welch
+except ImportError:
+    from path_setup import add_repo_root
+    add_repo_root()
+    from utils import find_eeg_stream, butter_bandpass, bandpower_welch
 
 
 

@@ -19,9 +19,9 @@ from matplotlib.widgets import Slider
 from scipy.signal import butter, sosfilt, welch
 
 # ---- Band ranges (edit these) ----
-BAND1 = (5, 20)    # Hz
-BAND2 = (7, 12)     # Hz
-BIN_WIDTH = 0.5     # Hz per bin for power breakdown
+BAND1 = (0.6, 1.1)    # Hz
+BAND2 = (10.5, 13)     # Hz
+BIN_WIDTH = 0.05     # Hz per bin for power breakdown
 
 
 def list_recordings(recordings_dir="recordings"):
@@ -71,11 +71,11 @@ def bandpass_filter(data, lo, hi, fs, order=4):
 
 
 def print_band_power(signal, fs, band, label):
-    """Compute PSD via Welch and print power in 0.5 Hz bins across the band."""
+    """Compute PSD via Welch and print power in bins across the band."""
     lo, hi = band
-    # Use long segments for fine frequency resolution (~0.125 Hz)
-    nperseg = min(len(signal), int(fs * 8))
-    freqs, psd = welch(signal, fs=fs, nperseg=nperseg)
+    # Use full signal for finest frequency resolution (df = fs / len)
+    # For 600s at 256 Hz: df ≈ 0.0017 Hz
+    freqs, psd = welch(signal, fs=fs, nperseg=len(signal))
     df = freqs[1] - freqs[0]
 
     print(f"\n  {label} ({lo}-{hi} Hz) power by {BIN_WIDTH} Hz bins  (df={df:.3f} Hz):")

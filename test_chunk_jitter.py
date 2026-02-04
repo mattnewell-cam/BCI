@@ -19,7 +19,7 @@ import numpy as np
 from pylsl import StreamInlet
 from utils import find_eeg_stream
 
-DURATION_S = 30
+DURATION_S = 10
 MAX_SAMPLES = 256  # same as lock_live_2
 
 

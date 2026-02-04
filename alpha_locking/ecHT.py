@@ -23,20 +23,26 @@ Usage:
     python ecHT.py  # lists available recordings
 """
 
-import sys
-import os
 from collections import deque
-
-# Add parent directory so 'from utils import ...' works inside alpha_lock_logic
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 from numpy.fft import fft, ifft, fftshift, ifftshift
 from scipy.signal import butter, freqz, iirnotch, lfilter, lfilter_zi, welch
 import matplotlib.pyplot as plt
 
-from alpha_lock_sample import load_recording, list_recordings
-from alpha_lock_logic import beep
+try:
+    from alpha_lock_sample import load_recording, list_recordings
+except ImportError:
+    from path_setup import add_repo_root
+    add_repo_root()
+    from alpha_lock_sample import load_recording, list_recordings
+
+try:
+    from alpha_lock_logic import beep
+except ImportError:
+    from path_setup import add_repo_root
+    add_repo_root()
+    from alpha_lock_logic import beep
 
 
 # ---------------------------------------------------------------------------

@@ -20,7 +20,12 @@ import numpy as np
 from scipy.signal import spectrogram as scipy_spectrogram, welch
 import matplotlib.pyplot as plt
 
-from alpha_lock_sample import load_recording, list_recordings
+try:
+    from alpha_lock_sample import load_recording, list_recordings
+except ImportError:
+    from path_setup import add_repo_root
+    add_repo_root()
+    from alpha_lock_sample import load_recording, list_recordings
 
 CHANNEL_LABELS = ["AF7", "AF8", "TP9", "TP10"]
 
@@ -46,8 +51,8 @@ def compute_spectrogram(data_1ch, fs, f_min=0, f_max=30):
     power_dB : ndarray, shape (n_freqs, n_times)
         Power spectral density in dB (10 * log10).
     """
-    nperseg = int(2 * fs)        # 2-second windows -> 0.5 Hz resolution
-    noverlap = int(1.5 * fs)     # 75% overlap
+    nperseg = int(4 * fs)        # 4-second windows -> 0.25 Hz resolution
+    noverlap = int(3 * fs)       # 75% overlap
 
     freqs, times, Sxx = scipy_spectrogram(
         data_1ch, fs=fs, nperseg=nperseg, noverlap=noverlap,
@@ -111,114 +116,6 @@ def compute_mean_psd(data_1ch, fs, f_min=0, f_max=30, bw=0.5, step=0.1):
     return centers, mean_db
 
 
-def compute_best_channel_spectrogram(specs, period_s=3.0):
-    """Build a composite spectrogram by picking the best-alpha channel per period.
-
-    For each *period_s*-second block, selects the channel with the highest
-    alpha (8-12 Hz) to total power ratio, then splices that channel's
-    spectrogram columns into the output.
-
-    Parameters
-    ----------
-    specs : list of (times, freqs, power_dB)
-        Per-channel spectrograms from compute_spectrogram().
-    period_s : float
-        Selection period in seconds.
-
-    Returns
-    -------
-    composite_dB : ndarray, shape (n_freqs, n_times)
-        Composite spectrogram in dB.
-    best_per_col : ndarray, shape (n_times,)
-        Which channel was selected for each time column.
-    """
-    times = specs[0][0]
-    freqs = specs[0][1]
-    n_times = len(times)
-    n_channels = len(specs)
-
-    # Stack all channels: (n_channels, n_freqs, n_times)
-    all_dB = np.stack([s[2] for s in specs], axis=0)
-
-    # Convert to linear for ratio computation
-    all_linear = 10 ** (all_dB / 10)
-
-    alpha_mask = (freqs >= 8) & (freqs <= 12)
-    total_mask = (freqs >= 1) & (freqs <= 30)
-
-    composite_dB = np.empty_like(all_dB[0])
-    best_per_col = np.empty(n_times, dtype=int)
-
-    # Group columns into periods
-    t0 = times[0]
-    period_start = t0
-    col = 0
-    while col < n_times:
-        # Find columns in this period
-        period_end = period_start + period_s
-        block_mask = (times >= period_start) & (times < period_end)
-        if not np.any(block_mask):
-            period_start = period_end
-            continue
-
-        block_idx = np.where(block_mask)[0]
-
-        # Compute alpha:total ratio per channel for this block
-        best_ratio, best_ch = -1.0, 0
-        for ch in range(n_channels):
-            block_power = all_linear[ch][:, block_idx]  # (n_freqs, n_block)
-            alpha_power = block_power[alpha_mask, :].sum()
-            total_power = block_power[total_mask, :].sum() + 1e-20
-            ratio = alpha_power / total_power
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_ch = ch
-
-        composite_dB[:, block_idx] = all_dB[best_ch][:, block_idx]
-        best_per_col[block_idx] = best_ch
-
-        period_start = period_end
-        col = block_idx[-1] + 1
-
-    return composite_dB, best_per_col
-
-
-def compute_mean_psd_from_spectrogram(freqs, power_dB, f_min=0, f_max=30,
-                                      bw=0.5, step=0.1):
-    """Rolling mean PSD from a spectrogram's time-averaged power.
-
-    Like compute_mean_psd but works from spectrogram data directly (used
-    for the composite best-channel panel).
-
-    Parameters
-    ----------
-    freqs : ndarray
-        Spectrogram frequency axis (Hz).
-    power_dB : ndarray, shape (n_freqs, n_times)
-        Spectrogram power in dB.
-    f_min, f_max, bw, step : float
-        Same as compute_mean_psd.
-
-    Returns
-    -------
-    centers, mean_db : ndarrays
-    """
-    raw_mean = power_dB.mean(axis=1)  # average dB across time
-
-    half = bw / 2
-    centers = np.arange(f_min, f_max + step / 2, step)
-    mean_db = np.empty(len(centers))
-    for i, fc in enumerate(centers):
-        mask = (freqs >= fc - half) & (freqs <= fc + half)
-        if np.any(mask):
-            mean_db[i] = raw_mean[mask].mean()
-        else:
-            idx = np.argmin(np.abs(freqs - fc))
-            mean_db[i] = raw_mean[idx]
-
-    return centers, mean_db
-
-
 def plot_spectrogram(recording, f_min=0, f_max=30):
     """Plot one spectrogram + PSD at a time; left/right arrows switch channel.
 
@@ -250,28 +147,21 @@ def plot_spectrogram(recording, f_min=0, f_max=30):
         times, freqs, power_dB = compute_spectrogram(data[ch], fs, f_min, f_max)
         specs.append((times, freqs, power_dB))
 
-    # Composite best-channel spectrogram
-    composite_dB, best_per_col = compute_best_channel_spectrogram(specs)
-
     # Global colour limits so all channels share the same scale
+    # Use nanpercentile to handle NaN values in recordings
     all_power = np.concatenate([s[2].ravel() for s in specs])
-    vmin = np.percentile(all_power, 5)
-    vmax = np.percentile(all_power, 99)
+    vmin = np.nanpercentile(all_power, 5)
+    vmax = np.nanpercentile(all_power, 99)
 
     total_duration = times[-1]
     default_window = min(10.0, total_duration)
 
-    # Pre-compute PSD for each panel so channel and PSD always match
-    panel_labels = list(labels) + [u"Best \u03b1"]
-    n_panels = n_channels + 1
+    # Pre-compute PSD for each channel
+    panel_labels = list(labels)
     psd_data = []
-    for i in range(n_panels):
-        if i < n_channels:
-            pf, mp = compute_mean_psd(
-                data[i], fs, f_min, f_max, bw=0.5, step=0.1)
-        else:
-            pf, mp = compute_mean_psd_from_spectrogram(
-                specs[0][1], composite_dB, f_min, f_max, bw=0.5, step=0.1)
+    for i in range(n_channels):
+        pf, mp = compute_mean_psd(
+            data[i], fs, f_min, f_max, bw=0.5, step=0.1)
         psd_data.append((pf, mp))
 
     # --- Figure layout: single spectrogram + PSD ---
@@ -296,7 +186,6 @@ def plot_spectrogram(recording, f_min=0, f_max=30):
                                cmap="viridis", vmin=vmin, vmax=vmax)]
 
     current_panel = [0]
-    t_full = specs[0][0]
 
     def draw_psd(panel_idx):
         """Redraw the PSD side-panel for the given channel."""
@@ -351,31 +240,10 @@ def plot_spectrogram(recording, f_min=0, f_max=30):
         x_min = pos
         x_max = pos + window
 
-        idx = current_panel[0]
-        if idx < n_channels:
-            t_src, f_src, p_src = specs[idx]
-        else:
-            t_src, f_src, p_src = specs[0][0], specs[0][1], composite_dB
-
-        # ------- DYNAMIC FIDELITY: comment out this block for full resolution,
-        #         and uncomment the two lines after "END DYNAMIC FIDELITY". ------
-        margin = (x_max - x_min) * 0.02
-        vis_mask = (t_src >= x_min - margin) & (t_src <= x_max + margin)
-        vis_idx = np.where(vis_mask)[0]
-        if len(vis_idx) == 0:
-            return
-        max_cols = 800
-        if len(vis_idx) > max_cols:
-            ds_step = max(1, len(vis_idx) // max_cols)
-            vis_idx = vis_idx[::ds_step]
-        t_render = t_src[vis_idx]
-        p_render = p_src[:, vis_idx]
-        # ------- END DYNAMIC FIDELITY (uncomment below for full resolution) -----
-        # t_render = t_src
-        # p_render = p_src
+        t_src, f_src, p_src = specs[current_panel[0]]
 
         mesh[0].remove()
-        mesh[0] = spec_ax.pcolormesh(t_render, f_src, p_render,
+        mesh[0] = spec_ax.pcolormesh(t_src, f_src, p_src,
                                       shading="gouraud", cmap="viridis",
                                       vmin=vmin, vmax=vmax)
         spec_ax.set_xlim(x_min, x_max)
@@ -385,7 +253,7 @@ def plot_spectrogram(recording, f_min=0, f_max=30):
         fig.canvas.draw_idle()
 
     def switch_panel(new_idx):
-        current_panel[0] = new_idx % n_panels
+        current_panel[0] = new_idx % n_channels
         title_text.set_text(
             f"Spectrogram: {recording.get('recording_name', '')} "
             + u"\u2014 " + f"{panel_labels[current_panel[0]]}")

@@ -11,8 +11,19 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pylsl import StreamInlet
 
-from utils import find_eeg_stream
-from alpha_lock_logic import AlphaLockProcessor, beep
+try:
+    from utils import find_eeg_stream
+except ImportError:
+    from path_setup import add_repo_root
+    add_repo_root()
+    from utils import find_eeg_stream
+
+try:
+    from alpha_lock_logic import AlphaLockProcessor, beep
+except ImportError:
+    from path_setup import add_repo_root
+    add_repo_root()
+    from alpha_lock_logic import AlphaLockProcessor, beep
 
 
 def main():
